@@ -1,0 +1,170 @@
+import { type ReactNode } from "react";
+import { FolderOpen, X, ShieldCheck } from "lucide-react";
+import { type Row } from "../api";
+export const ROLE: Row = { admin: "管理员", leader: "团队长", member: "队员" };
+export const STATE: Row = {
+  pending: "待审核",
+  expired: "证据失效",
+  writing: "待写",
+  verified: "已核验",
+  template: "模板资料",
+  archived: "已归档",
+  new: "新记录",
+  approved: "已批准",
+  returned: "已退回",
+  planned: "已排期",
+  staged: "待人工发表",
+  published: "已发表",
+  unknown: "结果未知",
+  cancelled: "已取消",
+  needs_review: "需重新审核",
+  candidate: "候选",
+  adopted: "已采纳",
+  excluded: "已排除",
+  queued: "排队中",
+  running: "生成中",
+  failed: "失败",
+  completed: "已完成",
+  partial: "部分完成",
+  confirmed: "已确认",
+  unprepared: "未准备",
+  producing: "制作中",
+  review: "待审",
+  dependency: "待依赖",
+  manual: "待人工发表",
+  skipped: "已跳过",
+};
+
+export function Badge({ value }: { value: string }) {
+  return (
+    <span
+      className={
+        "badge " +
+        ([
+          "verified",
+          "approved",
+          "published",
+          "adopted",
+          "completed",
+          "confirmed",
+        ].includes(value)
+          ? "good"
+          : ["failed", "needs_review", "unknown", "returned"].includes(value)
+            ? "bad"
+            : "")
+      }
+    >
+      {STATE[value] || value}
+    </span>
+  );
+}
+export function Empty({
+  title = "暂无数据",
+  body = "从新增或导入开始，建立你的内容资产。",
+  children,
+}: {
+  title?: string;
+  body?: string;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="empty">
+      <div className="empty-icon">
+        <FolderOpen size={30} />
+      </div>
+      <h3>{title}</h3>
+      <p>{body}</p>
+      {children}
+    </div>
+  );
+}
+export function Card({
+  title,
+  subtitle,
+  action,
+  children,
+  className = "",
+}: {
+  title?: string;
+  subtitle?: string;
+  action?: ReactNode;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <section className={"card " + className}>
+      {title && (
+        <div className="card-head">
+          <div>
+            <h2>{title}</h2>
+            {subtitle && <p>{subtitle}</p>}
+          </div>
+          {action}
+        </div>
+      )}
+      {children}
+    </section>
+  );
+}
+export function Modal({
+  title,
+  children,
+  onClose,
+}: {
+  title: string;
+  children: ReactNode;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="card-head">
+          <h2>{title}</h2>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">
+            <X size={20} />
+          </button>
+        </div>
+        {children}
+      </section>
+    </div>
+  );
+}
+export function Field({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <label className="field">
+      <span>{label}</span>
+      {children}
+    </label>
+  );
+}
+export function Notice({ children }: { children: ReactNode }) {
+  return (
+    <div className="notice">
+      <ShieldCheck size={17} />
+      <span>{children}</span>
+    </div>
+  );
+}
+export function fmt(v: string) {
+  return v
+    ? new Date(v).toLocaleString("zh-CN", {
+        hour12: false,
+        timeZone: "Asia/Shanghai",
+      })
+    : "—";
+}
+
+export const getError = (e: unknown) =>
+  e instanceof Error ? e.message : "操作失败";

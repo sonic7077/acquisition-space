@@ -1,0 +1,86 @@
+import {test,expect} from '@playwright/test';
+
+test('默认8个写手、素材调用和IP规则版本',async({page,request})=>{
+  await request.post('/api/auth/login',{data:{username:'admin',password:'admin'}});
+  const team=await(await request.post('/api/teams',{data:{name:'默认写手验收组'}})).json();
+  const ip=await(await request.post('/api/ips',{data:{name:'默认写手IP',team_id:team.id}})).json();
+  const mat=await(await request.post('/api/records/materials',{data:{ip_id:ip.id,title:'默认写手素材'+Date.now(),body:'预算咨询的作品描述'}})).json();
+  await page.goto('/');await page.getByRole('button',{name:'进入工作台'}).click();
+  await page.getByRole('button',{name:'IP与写手',exact:true}).click();
+  await expect(page.locator('.default-writer-card')).toHaveCount(8);
+  await page.getByLabel('默认写手目标IP',{exact:true}).selectOption(ip.id);
+  const card=page.locator('.default-writer-card').filter({has:page.getByRole('heading',{name:'原创口播写手',exact:true})});
+  await card.getByRole('button',{name:'规则与知识增强',exact:true}).click();
+  const details=page.getByRole('dialog',{name:'原创口播写手 · 规则与知识增强'});
+  await details.getByRole('button',{name:'提交完善建议',exact:true}).click();
+  const rule=page.getByRole('dialog',{name:'默认写手完善建议'});
+  await rule.getByLabel('规则来源',{exact:true}).selectOption('manual');
+  await rule.getByLabel('规则说明',{exact:true}).fill('开头直接给判断');
+  await rule.getByLabel('改后规则',{exact:true}).fill('开头直接给出一个可核验的判断，不寒暄。');
+  await rule.getByRole('button',{name:'保存候选建议',exact:true}).click();
+  await details.getByRole('button',{name:'采纳建议',exact:true}).click();
+  await expect(details).toContainText('IP增强 v2');
+  await details.getByRole('button',{name:'关闭',exact:true}).click();
+  await page.getByRole('button',{name:'选题库',exact:true}).click();
+  const row=page.locator('tr').filter({hasText:mat.title});
+  await row.getByRole('button',{name:'调用写手',exact:true}).click();
+  const call=page.getByRole('dialog',{name:'素材调用写手'});
+  await expect(call.getByLabel('调用目标IP',{exact:true})).toHaveValue(ip.id);
+  await call.getByLabel('选择写手',{exact:true}).selectOption('default:original-video-writer');
+  await call.getByRole('button',{name:'预览上下文',exact:true}).click();
+  await expect(call.getByLabel('素材写手提示包',{exact:true})).toContainText('开头直接给出一个可核验的判断');
+  await expect(call).toContainText('IP增强 v2');
+  await call.getByLabel('选择写手',{exact:true}).selectOption('default:writer-self-evolve');
+  await call.getByRole('button',{name:'预览上下文',exact:true}).click();
+  await expect(call.getByLabel('素材写手提示包',{exact:true})).toContainText('缺少3篇独立真实改稿证据');
+  await expect(call).toContainText('辅助分析');
+  await page.screenshot({path:'/tmp/default-writer-material.png',fullPage:true});
+  await page.setViewportSize({width:390,height:844});expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBeTruthy();
+  await page.screenshot({path:'/tmp/default-writer-material-mobile.png',fullPage:true});
+  await call.getByRole('button',{name:'关闭',exact:true}).click();
+});
+
+test('默认写手随知识核验更新并执行内容和辅助任务',async({page,request})=>{
+  const dataDir=process.env.E2E_DATA_DIR;test.skip(!dataDir,'需要隔离数据库执行器');
+  const {createServer}=await import('node:http');
+  const server=createServer((req,res)=>{let input='';req.on('data',b=>input+=b);req.on('end',()=>{const prompt=JSON.parse(input).messages[1].content;const content=prompt.includes('最终返回一个JSON对象')?JSON.stringify({title:'先明确服务范围',body:'先明确咨询需求，再核对服务范围。',publish_copy:'先核对服务范围',fact_check:'具体价格待核实'}):'进化分析报告：知识支持先说明服务范围；真实改稿不足，只提交候选建议。';res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{message:{content}}]}))})});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{
+    await request.post('/api/auth/login',{data:{username:'admin',password:'admin'}});
+    const team=await(await request.post('/api/teams',{data:{name:'默认知识组'}})).json();const ip=await(await request.post('/api/ips',{data:{name:'默认知识IP',team_id:team.id}})).json();
+    const preview=await(await request.post('/api/knowledge/preview',{multipart:{category_id:'methods-service',files:{name:'咨询范围.md',mimeType:'text/markdown',buffer:Buffer.from('预算咨询服务包含需求梳理、方案解释，不承诺收益。')}}})).json();
+    const imported=await(await request.post('/api/knowledge/confirm',{data:{batch_id:preview.id}})).json();const doc=imported.items[0];
+    const catalog=()=>request.get('/api/default-writers?ip_id='+ip.id).then(r=>r.json());
+    const originalKnowledgeCount=(await catalog())[0].knowledge.count;
+    await request.patch('/api/knowledge/'+doc.id,{data:{status:'verified'}});
+    expect((await catalog())[0].knowledge.count).toBe(originalKnowledgeCount+1);
+    const mat=await(await request.post('/api/records/materials',{data:{ip_id:ip.id,title:'预算咨询素材'+Date.now(),body:'预算咨询作品描述'}})).json();
+    const port=(server.address() as {port:number}).port;
+    await request.put('/api/settings',{data:{model:{base_url:`http://127.0.0.1:${port}/v1`,model:'browser-controlled',api_key:'local-test',enabled:true}}});
+    const {spawn}=await import('node:child_process');
+    async function runWorker(){await new Promise<void>((resolve,reject)=>{const p=spawn('uv',['run','--project','backend','--python','3.12','python','-c','from backend.app.main import create_app; from backend.app.worker import run_once; run_once(create_app())'],{cwd:process.cwd()+'/..',env:{...process.env,ACQUISITION_DATA_DIR:dataDir},stdio:'pipe'});let err='';p.stderr.on('data',b=>err+=b);p.on('error',reject);p.on('close',code=>code===0?resolve():reject(new Error(err)))})}
+    await page.goto('/');await page.getByRole('button',{name:'进入工作台'}).click();await page.getByRole('button',{name:'选题库',exact:true}).click();
+    await page.locator('tr').filter({hasText:mat.title}).getByRole('button',{name:'调用写手',exact:true}).click();
+    let modal=page.getByRole('dialog',{name:'素材调用写手'});
+    await modal.getByLabel('选择写手',{exact:true}).selectOption('default:original-video-writer');
+    await modal.getByRole('button',{name:'预览上下文',exact:true}).click();
+    await expect(modal.getByLabel('素材写手提示包',{exact:true})).toContainText('不承诺收益');
+    let submitted=page.waitForResponse(r=>r.url().endsWith(`/materials/${mat.id}/writing`)&&r.request().method()==='POST');
+    await modal.getByRole('button',{name:'提交写手任务',exact:true}).click();const job=await(await submitted).json();expect(job.id).toBeTruthy();await runWorker();
+    await modal.getByRole('button',{name:'查看待审稿',exact:true}).click();
+    const drafts=await(await request.get('/api/drafts')).json();const out=drafts.find((d:any)=>d.generation_job===job.id);expect(out.writer_snapshot.is_system).toBeTruthy();expect(out.knowledge_snapshot.count).toBe(originalKnowledgeCount+1);
+    await page.locator('.draft-item').filter({hasText:out.id.slice(0,8)}).click();
+    await page.getByRole('button',{name:'用辅助写手分析',exact:true}).click();
+    const draftAnalysis=page.getByRole('dialog',{name:'稿件辅助分析'});
+    await draftAnalysis.getByRole('button',{name:'预览上下文',exact:true}).click();
+    await expect(draftAnalysis.getByLabel('素材写手提示包',{exact:true})).toContainText(out.body);
+    await expect(draftAnalysis.getByLabel('选择写手',{exact:true}).locator('option')).toHaveCount(3);
+    await draftAnalysis.getByRole('button',{name:'关闭',exact:true}).click();
+    await page.getByRole('button',{name:'选题库',exact:true}).click();await page.locator('tr').filter({hasText:mat.title}).getByRole('button',{name:'调用写手',exact:true}).click();modal=page.getByRole('dialog',{name:'素材调用写手'});
+    await modal.getByLabel('选择写手',{exact:true}).selectOption('default:writer-self-evolve');submitted=page.waitForResponse(r=>r.url().endsWith(`/materials/${mat.id}/writing`)&&r.request().method()==='POST');await modal.getByRole('button',{name:'提交写手任务',exact:true}).click();await submitted;await runWorker();
+    await modal.getByRole('button',{name:'查看辅助分析',exact:true}).click();
+    const report=(await(await request.get('/api/writing/analyses')).json()).find((a:any)=>a.material_id===mat.id);expect(report.writer_snapshot.skill).toBe('writer-self-evolve');expect(report.body).toContain('只提交候选建议');
+    await request.patch('/api/knowledge/'+doc.id,{data:{status:'archived'}});expect((await catalog())[0].knowledge.count).toBe(originalKnowledgeCount);
+    expect((await(await request.get('/api/drafts/'+out.id)).json()).knowledge_snapshot.count).toBe(originalKnowledgeCount+1);
+  }finally{await request.put('/api/settings',{data:{model:{enabled:false}}});await new Promise<void>(resolve=>server.close(()=>resolve()))}
+});

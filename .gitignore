@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+.pytest_cache/
+.venv/
+node_modules/
+dist/
+.data/
+.env
+*.pyc
+test-results/
+playwright-report/
+*.tsbuildinfo
+backups/
+/docs/知识库同步/
