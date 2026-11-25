@@ -91,3 +91,115 @@ def test_exported_skill_contains_selected_template_not_empty_placeholders(env):
         assert '## '+writing_rules.strip() in profile['skill_text']
         assert '## 先填' not in profile['skill_text']
         assert '＿＿＿' not in profile['skill_text']
+
+
+def upload_knowledge(client, title, text, *, verify=True, valid_until=None):
+    preview = client.post('/api/knowledge/preview', data={'category_id': 'product-medical'},
+                          files={'files': (title + '.md', text.encode(), 'text/markdown')})
+    assert preview.status_code == 200, preview.text
+    imported = client.post('/api/knowledge/confirm', json={'batch_id': preview.json()['id']})
+    assert imported.status_code == 200, imported.text
+    document = imported.json()['items'][0]
+    if verify:
+        verified = client.patch(f"/api/knowledge/{document['id']}",
+                                json={'status': 'verified', 'valid_until': valid_until})
+        assert verified.status_code == 200, verified.text
+        return verified.json()
+    return document
+
+
+def generate_input(ip, **extra):
+    return {'ip_id': ip['id'], 'name': '家庭医疗写手', 'industry': '社保断缴',
+            'skill': 'original-video-writer', 'answers': answers(), **extra}
+
+
+def test_generate_combines_valid_shared_knowledge_and_selected_format(env):
+    _, admin, ip, users = env
+    automatic = upload_knowledge(admin, '社保断缴咨询流程', '社保断缴后先核对保障生效时间。')
+    selected = upload_knowledge(admin, '别的文档', '仅用于用户指定资料测试的正文。')
+    upload_knowledge(admin, '社保断缴待核实', '社保断缴情况尚未确认。', verify=False)
+    upload_knowledge(admin, '社保断缴历史说明', '社保断缴的旧说明。', valid_until='2000-01-01')
+
+    result = users['leader'].post('/api/writers/generate', json=generate_input(
+        ip, knowledge_ids=[selected['id'], selected['id']]))
+
+    assert result.status_code == 200, result.text
+    profile = result.json()
+    assert profile['status'] == 'active' and profile['ip_id'] == ip['id']
+    assert profile['word_limit'] == 1500 and profile['skill'] == 'original-video-writer'
+    assert '称呼你' in profile['skill_text'] and '内容文体参考：原创口播' in profile['skill_text']
+    assert selected['text'] not in profile['skill_text']
+    assert profile['knowledge_ids'] == [selected['id']]
+    assert [source['id'] for source in profile['knowledge_sources']] == [selected['id'], automatic['id']]
+    for source, document in zip(profile['knowledge_sources'], (selected, automatic)):
+        assert source == {key: document[key] for key in ('id', 'title', 'category_id', 'category_path', 'hash')}
+    assert admin.get(f"/api/writers/{profile['id']}").json() == profile
+
+
+def test_regenerate_preserves_versioned_binding_and_rejects_stale_updates(env):
+    _, admin, ip, _ = env
+    document = upload_knowledge(admin, '服务清单', '各项服务以确认清单为准。')
+    data = generate_input(ip, knowledge_ids=[document['id']])
+    profile = admin.post('/api/writers/generate', json=data).json()
+    assert profile.get('id'), profile
+    admin.post(f"/api/writers/{profile['id']}/default", json={'version': profile['version']})
+    profile = admin.get(f"/api/writers/{profile['id']}").json()
+    update = generate_input(ip, name='改版写手', writer_id=profile['id'], expected_version=profile['version'])
+
+    regenerated = admin.post('/api/writers/generate', json=update)
+    assert regenerated.status_code == 200, regenerated.text
+    current = regenerated.json()
+    assert current['id'] == profile['id'] and current['version'] == profile['version'] + 1
+    assert current['status'] == 'active' and current['is_default'] is True
+    assert current['knowledge_ids'] == [document['id']]
+    assert admin.post('/api/writers/generate', json=update).status_code == 409
+
+    update.update(expected_version=current['version'], knowledge_ids=[])
+    cleared = admin.post('/api/writers/generate', json=update).json()
+    assert cleared['knowledge_ids'] == []
+    assert cleared['knowledge_sources'] == []
+    assert cleared['history'][-1]['knowledge_ids'] == [document['id']]
+    assert cleared['history'][-1]['knowledge_sources'] == current['knowledge_sources']
+
+
+def test_generate_enforces_writer_permissions_and_validates_before_saving(env):
+    _, admin, ip, users = env
+    member = users['member']
+    pending = upload_knowledge(admin, '未核实说明', '只供编辑阅读。', verify=False)
+    expired = upload_knowledge(admin, '旧说明', '已经过期。', valid_until='2000-01-01')
+    for extra in ({'knowledge_ids': [pending['id']]}, {'knowledge_ids': [expired['id']]},
+                  {'knowledge_ids': ['missing']}, {'answers': []}, {'skill': 'writer-self-evolve'}):
+        assert admin.post('/api/writers/generate', json=generate_input(ip, **extra)).status_code == 422
+    assert admin.get('/api/writers').json() == []
+
+    result = member.post('/api/writers/generate', json=generate_input(ip))
+    assert result.status_code == 200, result.text
+    profile = result.json()
+    assert profile['status'] == 'compiled' and not profile.get('approved_by')
+    assert member.post(f"/api/writers/{profile['id']}/activate", json={'version': profile['version']}).status_code == 403
+    assert member.post('/api/writers/generate', json=generate_input({'id': 'not-authorized'})).status_code == 403
+    active = users['leader'].post(f"/api/writers/{profile['id']}/activate", json={'version': profile['version']}).json()
+    forbidden = member.post('/api/writers/generate', json=generate_input(
+        ip, writer_id=profile['id'], expected_version=active['version']))
+    assert forbidden.status_code == 403
+    bad_update = admin.post('/api/writers/generate', json=generate_input(
+        ip, writer_id=profile['id'], expected_version=active['version'], knowledge_ids=[expired['id']]))
+    assert bad_update.status_code == 422
+    assert admin.get(f"/api/writers/{profile['id']}").json() == active
+
+
+def test_draft_apis_preserve_explicit_bindings_for_the_legacy_compile_route(env):
+    _, admin, ip, users = env
+    member = users['member']
+    document = upload_knowledge(admin, '核验资料', '用于编辑草稿时选择。')
+    created = member.post('/api/writers', json=generate_input(ip, knowledge_ids=[document['id']]))
+    assert created.status_code == 200, created.text
+    profile = created.json()
+    assert profile['status'] == 'draft' and profile['knowledge_ids'] == [document['id']]
+    endpoint = f"/api/writers/{profile['id']}"
+    updated = member.patch(endpoint, json={'version': profile['version'], 'industry': '保险咨询'})
+    assert updated.status_code == 200 and updated.json()['knowledge_ids'] == [document['id']]
+    compiled = member.post(endpoint + '/compile', json={'version': updated.json()['version']})
+    assert compiled.status_code == 200 and compiled.json()['knowledge_sources'][0]['id'] == document['id']
+    cleared = member.patch(endpoint, json={'version': compiled.json()['version'], 'knowledge_ids': []})
+    assert cleared.status_code == 200 and cleared.json()['knowledge_ids'] == []

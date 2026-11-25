@@ -17,6 +17,74 @@ def params(w,d):
     return {'writer_id':w['id'],'writer_version':w['version'],'version':d['version'],'skill':'viral-rewrite-writer','reference':'买保险先看这三件事。第一是免责条款，第二是健康告知，第三是家庭预算。不要跟风下单。','transcript_confirmed':True,'comment_ids':[],'instructions':'用具体场景表达'}
 
 
+def add_verified_knowledge(c, title, text):
+    preview = c.post('/api/knowledge/preview', data={'category_id': 'product-critical-illness'},
+                     files={'files': (title + '.md', text.encode(), 'text/markdown')})
+    assert preview.status_code == 200, preview.text
+    confirmed = c.post('/api/knowledge/confirm', json={'batch_id': preview.json()['id']})
+    assert confirmed.status_code == 200, confirmed.text
+    doc = confirmed.json()['items'][0]
+    verified = c.patch('/api/knowledge/' + doc['id'], json={'status': 'verified'})
+    assert verified.status_code == 200, verified.text
+    return verified.json()
+
+
+def set_writer_knowledge(app, writer, linked, matched=()):
+    with app.state.Session.begin() as db:
+        row = db.get(Record, writer['id'])
+        row.payload = {**row.payload, 'knowledge_ids': [doc['id'] for doc in linked],
+                       'knowledge_sources': [{k: doc[k] for k in ('id', 'title', 'hash', 'category_path')}
+                                             for doc in (*linked, *matched)]}
+
+
+def test_linked_knowledge_is_prioritized_and_demand_brings_live_matches(env):
+    app, c, ip, _ = env
+    w = ready(c, ip['id'])
+    linked = add_verified_knowledge(c, '服务手册', '核验资料正文甲')
+    current = add_verified_knowledge(c, '门诊慢特病', '申请门诊慢特病的核验说明')
+    unrelated = add_verified_knowledge(c, '异地门店', '旧配置匹配的门店专用说明')
+    set_writer_knowledge(app, w, [linked], [unrelated])
+    need = c.post('/api/records/needs', json={'ip_id': ip['id'], 'title': '门诊慢特病'}).json()
+    d = draft(c, ip['id'])
+    m = c.post('/api/records/materials', json={'ip_id': ip['id'], 'title': '选保障先看责任'}).json()
+    for path, args in (
+        (f"/api/drafts/{d['id']}/rewrite/context", {}),
+        (f"/api/materials/{m['id']}/writing/context", {'ip_id': ip['id']}),
+        ('/api/writing/context', {'ip_id': ip['id'], 'topic': '选保障先看责任'}),
+    ):
+        response = c.post(path, json={**params(w, d), **args, 'need_id': need['id']})
+        assert response.status_code == 200, response.text
+        ctx = response.json()
+        assert [doc['id'] for doc in ctx['sources']] == [linked['id'], current['id']]
+        assert [doc['id'] for doc in ctx['knowledge_snapshot']['documents']] == [linked['id'], current['id']]
+        assert linked['text'] in ctx['prompt'] and current['text'] in ctx['prompt']
+        assert unrelated['title'] not in ctx['prompt']
+
+
+def test_edited_or_expired_writer_knowledge_is_omitted_until_verified(env):
+    app, c, ip, _ = env
+    w = ready(c, ip['id'])
+    edited = add_verified_knowledge(c, '旧知识独有标题', '旧正文专有标记')
+    expired = add_verified_knowledge(c, '过期知识独有标题', '过期正文专有标记')
+    set_writer_knowledge(app, w, [edited, expired])
+    assert c.patch('/api/knowledge/' + edited['id'], json={'text': '核验后的最新正文'}).json()['status'] == 'pending'
+    assert c.patch('/api/knowledge/' + expired['id'], json={'valid_until': '2000-01-01'}).status_code == 200
+    d = draft(c, ip['id'])
+    url = f"/api/drafts/{d['id']}/rewrite/context"
+    response = c.post(url, json=params(w, d))
+    assert response.status_code == 200, response.text
+    ctx = response.json()
+    assert not ctx['sources'] and ctx['knowledge_snapshot']['count'] == 0
+    for doc in (edited, expired):
+        assert doc['title'] not in ctx['prompt'] and doc['text'] not in ctx['prompt']
+    assert '核验后的最新正文' not in ctx['prompt']
+    assert c.patch('/api/knowledge/' + edited['id'], json={'status': 'verified'}).status_code == 200
+    refreshed = c.post(url, json=params(w, d)).json()
+    assert refreshed['sources'][0]['id'] == edited['id']
+    assert refreshed['sources'][0]['hash'] != edited['hash']
+    assert '核验后的最新正文' in refreshed['prompt']
+
+
 def test_context_requires_real_transcript_and_active_same_ip_writer(env):
     app,c,ip,users=env;w=ready(c,ip['id']);d=draft(c,ip['id']);p=params(w,d);url=f"/api/drafts/{d['id']}/rewrite/context"
     r=c.post(url,json={**p,'reference':''});assert r.status_code==422
@@ -86,7 +154,14 @@ def test_unconfirmed_reference_label_in_material_and_rewrite_context(env):
 
 
 def test_queue_candidate_preserves_original_and_parses_fields(env):
-    app,c,ip,users=env;w=ready(c,ip['id']);d=draft(c,ip['id']);p=params(w,d)
+    app, c, ip, _ = env
+    linked = add_verified_knowledge(c, '服务手册', '本次模型提示包含的核验材料。')
+    writer = c.post('/api/writers/generate', json={'ip_id': ip['id'], 'name': '专属改编写手', 'industry': '保险',
+                    'skill': 'viral-rewrite-writer', 'answers': answers(), 'knowledge_ids': [linked['id']]})
+    assert writer.status_code == 200, writer.text
+    w = writer.json()
+    d = draft(c, ip['id'])
+    p = params(w, d)
     seen=[]
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -107,10 +182,13 @@ def test_queue_candidate_preserves_original_and_parses_fields(env):
         assert candidate['body']=='先列出你关心的保障，再逐条核对免责。'
         assert candidate['title']=='条款怎么核对' and candidate['cover']=='先看责任'
         assert candidate['writer_snapshot']['name']==w['name'] and candidate['word_limit']==1500
+        assert candidate['sources'][0]['id'] == linked['id']
+        assert candidate['knowledge_snapshot']['documents'][0]['hash'] == linked['hash']
         assert candidate['reference']==p['reference'] and candidate['parent_draft_id']==d['id']
         assert candidate['fact_status']=='pending' and candidate['approved_version'] is None
         assert c.get('/api/drafts/'+d['id']).json()['body']==d['body']
-        assert seen[0]['messages'][1]['content'].find(p['reference'])>=0
+        assert p['reference'] in seen[0]['messages'][1]['content']
+        assert linked['text'] in seen[0]['messages'][1]['content']
         assert any(x['name']=='正文不超过1500字' for x in candidate['checks'])
     finally:server.shutdown();server.server_close();thread.join()
 

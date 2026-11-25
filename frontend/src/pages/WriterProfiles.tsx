@@ -1,51 +1,360 @@
-import DefaultWriters from './DefaultWriters';
-import {useEffect,useState} from 'react';
-import {Plus,Download,Copy,BookOpen,Sparkles} from 'lucide-react';
-import {api,post,patch,saveText,type Row} from '../api';
-import {Card,Empty,Field,Modal,Notice} from '../components/ui';
-import {type Ctx,useRows,filterIp} from '../context';
+import { useEffect, useState, type FormEvent } from 'react';
+import { ArrowRight, Copy, Download, Plus, Sparkles } from 'lucide-react';
+import { api, patch, post, saveText, type Row } from '../api';
+import { Card, Field, Modal, Notice } from '../components/ui';
+import { useRows, verifiedKnowledge, type Ctx } from '../context';
 
-const STATUS:Row={draft:'待补充',compiled:'待确认',active:'可用',stale:'需更新',archived:'已归档'};
-const KINDS:Row={delete:'删掉',add:'加上',replace:'换词',reorder:'挪动'};
-export default function WriterProfiles(c:Ctx){
-  const rows=filterIp(useRows('/writers',c.version),c.ip),drafts=useRows('/drafts',c.version);
-  const [samples,setSamples]=useState<Row|null>(null),[refs,setRefs]=useState<Row|null>(null),[selected,setSelected]=useState(''),[edit,setEdit]=useState<Row|null>(null),[rule,setRule]=useState<Row|null>(null),[reference,setReference]=useState<Row|null>(null),[library,setLibrary]=useState(false),[busy,setBusy]=useState(false),[evidence,setEvidence]=useState<Row|null>(null),[evidenceIds,setEvidenceIds]=useState<string[]>([]);
-  useEffect(()=>{api('/writers/reference').then(setRefs).catch(()=>c.notify('写手参考库加载失败，请刷新重试'));},[]);
-  const current=rows.find(r=>r.id===selected)||(!selected?rows[0]:undefined);
-  useEffect(()=>{setSelected('')},[c.ip]);
-  const canManage=c.me.role!=='member';
-  const canEdit=current&&(canManage||current.created_by===c.me.id&&!current.approved_by&&current.status!=='archived');
-  const templates:Row[]=refs?.templates||[];
-  async function perform(fn:()=>Promise<any>,message:string){setBusy(true);const r=await c.run(fn,message);setBusy(false);return r;}
-  function newWriter(skill='viral-rewrite-writer',copy?:Row){setSamples(null);setEdit({industry:copy?.industry||'',name:copy?copy.name+'（副本）':'',ip_id:copy?.ip_id||c.ip,skill,answers:copy?.answers||Array(12).fill('')});}
-  async function command(action:string){if(current)await perform(()=>post(`/writers/${current.id}/${action}`,{version:current.version}),action==='compile'?'SKILL已更新，请审核后启用':'写手状态已更新');}
+const STATUS: Record<string, string> = {
+  draft: '草稿', compiled: '待审核', active: '可用', stale: '需更新', archived: '已归档',
+};
+const KINDS: Record<string, string> = {
+  delete: '删掉', add: '加上', replace: '换词', reorder: '挪动',
+};
+const KNOWLEDGE_LIMIT = 8;
+
+interface WriterForm {
+  name: string;
+  industry: string;
+  skill: string;
+  answers: string[];
+  knowledge_ids: string[];
+}
+
+function writerForm(writer?: Row): WriterForm {
+  return {
+    name: writer?.name || '',
+    industry: writer?.industry || '',
+    skill: writer?.skill || 'viral-rewrite-writer',
+    answers: Array.from({ length: 12 }, (_, index) => writer?.answers?.[index] || ''),
+    knowledge_ids: writer?.knowledge_ids || [],
+  };
+}
+
+interface Props {
+  c: Ctx;
+  ipId: string;
+  onRewrite?: (writerId: string) => void;
+}
+
+export default function WriterProfiles({ c, ipId, onRewrite }: Props) {
+  const writers = useRows('/writers', c.version).filter(writer => writer.ip_id === ipId);
+  const drafts = useRows('/drafts', c.version).filter(draft => draft.ip_id === ipId);
+  const [refs, setRefs] = useState<Row | null>(null);
+  const [knowledgeRows, setKnowledgeRows] = useState<Row[] | null>(null);
+  const [knowledgeError, setKnowledgeError] = useState(false);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [saved, setSaved] = useState<Row | null>(null);
+  const [changes, setChanges] = useState<{ fields: WriterForm; version?: number } | null>(null);
+  const [samples, setSamples] = useState<Row | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    api<Row>('/writers/reference').then(result => {
+      if (active) setRefs(result);
+    }).catch(() => {
+      if (active) c.notify('写手参考库加载失败，请刷新重试');
+    });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    api<Row[]>('/knowledge').then(result => {
+      if (active) {
+        setKnowledgeRows(result);
+        setKnowledgeError(false);
+      }
+    }).catch(() => {
+      if (active) setKnowledgeError(true);
+    });
+    return () => { active = false; };
+  }, [c.version]);
+
+  const selectedId = selected ?? (writers.find(writer => writer.is_default)?.id || writers.find(writer => writer.status !== 'archived')?.id || writers[0]?.id || '');
+  const loaded = writers.find(writer => writer.id === selectedId);
+  const current = saved && saved.id === selectedId && (!loaded || saved.version > loaded.version) ? saved : loaded;
+  const choices = saved && !writers.some(writer => writer.id === saved.id) ? [saved, ...writers] : writers;
+  const canManage = c.me.role !== 'member';
+  const canEdit = !current || (current.status !== 'archived' && (canManage || current.created_by === c.me.id && !current.approved_by));
+  const readyToRewrite = current?.status === 'active' && !changes;
+  const data = changes?.fields ?? writerForm(current);
+  const templates = (refs?.templates || []).filter((template: Row) => template.kind === 'content');
+  const knowledge = verifiedKnowledge(knowledgeRows || []);
+  const staleKnowledge = knowledgeRows && !knowledgeError ? data.knowledge_ids.filter(id => !knowledge.some(doc => doc.id === id)) : [];
+  const matchedKnowledge: Row[] = current?.knowledge_sources || [];
+  const noVerifiedKnowledge = knowledgeRows && !knowledgeError && knowledge.length === 0;
+  const completed = data.answers.filter(answer => answer.trim()).length;
+  const lengthLimit = data.answers[10];
+  const validLimit = /^[0-9]+$/.test(lengthLimit) && Number(lengthLimit) >= 1 && Number(lengthLimit) <= 10000;
+  const knowledgeChanged = data.knowledge_ids.join(',') !== (current?.knowledge_ids || []).join(',');
+
+  function selectWriter(id: string) {
+    setSelected(id);
+    setChanges(null);
+    setSamples(null);
+  }
+
+  function changeFields(patch: Partial<WriterForm>) {
+    if (selected === null) setSelected(selectedId);
+    setChanges(previous => ({ fields: { ...data, ...patch }, version: previous?.version ?? current?.version }));
+  }
+
+  function acceptWriter(writer: Row) {
+    setSaved(writer);
+    selectWriter(writer.id);
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
+    const generate = submitter?.value !== 'draft';
+    if (busy || !canEdit || !data.name.trim()) return;
+    if (generate && (!refs || completed !== 12 || !validLimit)) return;
+    if (knowledgeChanged && staleKnowledge.length) return;
+
+    const fields = {
+      name: data.name,
+      industry: data.industry,
+      skill: data.skill,
+      answers: data.answers,
+      ...(!current || knowledgeChanged ? { knowledge_ids: data.knowledge_ids } : {}),
+    };
+    const version = changes?.version ?? current?.version;
+    setBusy(true);
+    try {
+      const writer = await c.run(() => {
+        if (generate) return post('/writers/generate', {
+          ...fields,
+          ip_id: ipId,
+          ...(current ? { writer_id: current.id, expected_version: version } : {}),
+        });
+        if (current) return patch('/writers/' + current.id, { ...fields, version });
+        return post('/writers', { ...fields, ip_id: ipId });
+      }, generate ? (canManage ? 'IP Skill 已生成并启用' : 'IP Skill 已生成，等待审核') : '写手草稿已保存');
+      if (writer) acceptWriter(writer);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function examples() {
+    setBusy(true);
+    try {
+      const result = await c.run(() => post('/writers/examples', {
+        industry: data.industry, ip_id: ipId, skill: data.skill, answers: data.answers,
+      }), '参考样例已生成，请核对后使用');
+      if (result) setSamples(result);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function command(action: string) {
+    if (!current) return;
+    setBusy(true);
+    try {
+      const writer = await c.run(() => post(`/writers/${current.id}/${action}`, { version: current.version }), '写手状态已更新');
+      if (writer) acceptWriter(writer);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return <>
-    <DefaultWriters {...c} onCreate={skill=>newWriter(skill)}/>
-    <div className="writer-section-head"><div><h2>写手 skill</h2><p>一个账号一个身份，从12问和真实手改中建立专属写手。</p></div><div className="button-row"><button onClick={()=>setLibrary(!library)}><BookOpen size={15}/>8个参考能力</button><button className="primary" onClick={()=>newWriter()}><Plus size={16}/>新建写手</button></div></div>
-    {library&&<Card title="分享包参考能力" subtitle="内容文体与辅助分析分开使用；参考文件不会被修改或执行。"><div className="writer-reference-grid">{templates.map(t=><button key={t.id} onClick={()=>setReference(t)}><strong>{t.name}</strong><small>{t.kind==='content'?'内容写作模板':'辅助分析能力'}</small></button>)}</div></Card>}
-    <div className="writer-layout"><div className="writer-list" aria-label="专属写手列表">{rows.map(w=><button key={w.id} className={'writer-item '+(current?.id===w.id?'selected':'')} onClick={()=>setSelected(w.id)}><strong>{w.name}</strong><p>{c.ips.find(i=>i.id===w.ip_id)?.name} · v{w.version}{w.is_default?' · 默认':''}</p><span>{w.rules.filter((r:Row)=>r.status==='adopted').length} 条语感</span><span className={'writer-status '+w.status}>{STATUS[w.status]}</span></button>)}{!rows.length&&<Empty title="还没有专属写手" body="先选择IP，填写12问；也可以从参考能力开始。"/>}</div>
-    <div className="writer-detail">{current?<>
-      <Card title={current.name+' · 写手 skill'} subtitle={`${c.ips.find(i=>i.id===current.ip_id)?.name} · v${current.version} · ${STATUS[current.status]}`} action={<div className="button-row">{canEdit&&<button disabled={busy} onClick={()=>{setSamples(null);setEdit({...current})}}>修改12个回答</button>}{canEdit&&<button className="primary" disabled={busy||current.status==='archived'} onClick={()=>command('compile')}><Sparkles size={14}/>生成 / 更新 SKILL</button>}</div>}>
-        <div className="writer-summary">{[['喊话对象',1],['卖什么',2],['签名与口头禅',8],['称呼规则',9],['字数上限',10],['禁区',6]].map(([label,index])=><div key={label}><span>{label}</span><strong>{current.answers[Number(index)]||'待补充'}{index===10&&current.answers[10]?' 字':''}</strong></div>)}</div>
-        <div className="button-row writer-state-actions"><span className={'writer-status '+current.status}>{STATUS[current.status]}</span>{canManage&&current.status==='compiled'&&<button className="primary" disabled={busy} onClick={()=>command('activate')}>确认启用写手</button>}{canManage&&current.status==='active'&&!current.is_default&&<button disabled={busy} onClick={()=>command('default')}>设为默认写手</button>}{canManage&&current.status!=='archived'&&<button disabled={busy} onClick={()=>command('archive')}>归档写手</button>}<button onClick={()=>newWriter(current.skill,current)}>复制为新写手</button></div>
-        {current.status==='stale'&&<Notice>问答或已采纳语感发生变更，需要更新SKILL并重新确认后才可用于新任务；旧稿保留原写手快照。</Notice>}
-        {current.answers.some((a:string)=>a.includes('待核'))&&<Notice>回答中有待核实信息。写作时请用共享知识库里的已核验资料核对事实。</Notice>}
-      </Card>
-      <Card title="语感规则 · 从手改里提炼" subtitle="删掉、加上、换词、挪动；人工偏好和有证据的学习规律分别记录。" action={<button disabled={current.status==='archived'} onClick={()=>setRule({kind:'replace',source:'manual',title:'',before:'',after:''})}><Plus size={14}/>加一条语感</button>}>
-        <div className="writer-rules">{current.rules.filter((r:Row)=>r.status!=='archived').map((r:Row,i:number)=><div key={r.id}><div className="writer-rule-title"><strong>{i+1}. {r.title}</strong><span>{KINDS[r.kind]} · {r.source==='manual'?'人工设定偏好':'改稿学习'} · {r.status==='adopted'?'已采纳':'候选'}</span></div><p><del>{r.before||'（无）'}</del><span className="muted"> → </span><ins>{r.after||'（删除）'}</ins></p>{canManage&&<div className="button-row">{r.status==='candidate'&&<button disabled={busy} onClick={()=>r.source==='learned'?(setEvidence(r),setEvidenceIds([])):perform(()=>post(`/writers/${current.id}/rules/${r.id}/adopt`,{}),'语感已采纳，请更新SKILL')}>采纳语感</button>}<button disabled={busy} onClick={()=>perform(()=>post(`/writers/${current.id}/rules/${r.id}/archive`,{}),'语感已归档，请更新SKILL')}>归档语感</button></div>}</div>)}{!current.rules.some((r:Row)=>r.status!=='archived')&&<Empty title="暂无语感规则" body="添加一条具体规则和改前、改后例句；不自动虚构规律。"/>}</div>
-      </Card>
-      <Card title="生成的 SKILL.md" subtitle={current.skill_text?'保存版本可追溯，后续修改不会改变已生成稿件的快照。':'完整填写12问后生成，生成过程不额外调用付费模型。'} action={current.skill_text?<div className="button-row"><button onClick={async()=>{try{await navigator.clipboard.writeText(current.skill_text);c.notify('SKILL已复制')}catch{c.notify('复制失败，可选中文本或下载文件')}}}><Copy size={14}/>复制全文</button><button onClick={()=>saveText(current.name+'-SKILL.md',current.skill_text)}><Download size={14}/>下载</button></div>:undefined}><textarea className="context-text" aria-label="生成的SKILL" readOnly value={current.skill_text||'尚未生成'}/><details><summary>历史版本 · {current.history.length}</summary>{[...current.history].reverse().map((h:Row)=><details key={h.version}><summary>v{h.version} · {h.name} · {STATUS[h.status]}</summary><pre className="writer-history">{h.skill_text||'该版本尚无SKILL'}</pre></details>)}</details></Card>
-    </>:<Card><Empty title="建立你的第一个写手" body="填写身份、客户、产品、风格和禁区；系统将其编成可选择的写作参考。"><button className="primary" onClick={()=>newWriter()}>填写12问</button></Empty></Card>}</div></div>
-    {edit&&<Modal title={edit.id?'修改写手12问':'新建专属写手'} onClose={()=>{setEdit(null);setSamples(null)}}><form onSubmit={async e=>{e.preventDefault();const r=await perform(()=>edit.id?patch('/writers/'+edit.id,{version:edit.version,name:edit.name,skill:edit.skill,industry:edit.industry,answers:edit.answers}):post('/writers',edit),'12问已保存');if(r){setSelected(r.id);setEdit(null)}}}>
-      <div className="form-grid"><Field label="写手名称"><input aria-label="写手名称" required maxLength={80} value={edit.name} onChange={e=>setEdit({...edit,name:e.target.value})}/></Field><Field label="写手所属IP"><select aria-label="写手所属IP" required disabled={!!edit.id} value={edit.ip_id} onChange={e=>setEdit({...edit,ip_id:e.target.value})}><option value="">请选择IP</option>{c.ips.map(i=><option key={i.id} value={i.id}>{i.name}</option>)}</select></Field></div>
-      <Field label="所属行业"><input aria-label="所属行业" maxLength={100} value={edit.industry||''} placeholder="例如：家装设计、保险咨询、教育培训" onChange={e=>{setEdit({...edit,industry:e.target.value});setSamples(null)}}/></Field>
-      <button type="button" disabled={busy||!edit.industry?.trim()} onClick={async()=>{const r=await perform(()=>post('/writers/examples',{industry:edit.industry,ip_id:edit.ip_id||null,skill:edit.skill,answers:edit.answers}), '参考样例已生成，请核对后使用');if(r)setSamples(r)}}><Sparkles size={14}/>生成参考样例</button>
-      {samples&&samples.industry===edit.industry?.trim()&&<div className="schema-preview"><Notice>{samples.notice}仅填入空白回答，已有内容保留；不会自动保存或启用写手。</Notice><details open><summary>查看12问参考样例</summary>{samples.answers.map((a:string,i:number)=><p key={i}><strong>第{i+1}问：</strong>{a}</p>)}</details><button type="button" onClick={()=>{setEdit({...edit,answers:Array.from({length:12},(_,i)=>edit.answers[i]?.trim()?edit.answers[i]:samples.answers[i])});setSamples(null)}}>仅填入空白项</button></div>}
-      <Field label="参考文体"><select value={edit.skill} onChange={e=>setEdit({...edit,skill:e.target.value})}>{templates.filter(t=>t.kind==='content').map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select></Field><Notice>可先保存草稿，生成时12问都必须有回答；确实没有填“无”，未知事实填“待核实”。问题11填写正整数。事实问答不会自动变为已核验知识。</Notice>
-      <div className="writer-questionnaire">{refs?.questions.map((q:string,i:number)=><Field key={i} label={`${i+1}. ${q}`}>{i===10?<input type="number" min={1} max={10000} aria-label={`第${i+1}问`} value={edit.answers[i]||''} onChange={e=>{const a=[...edit.answers];a[i]=e.target.value;setEdit({...edit,answers:a})}}/>:<textarea rows={3} aria-label={`第${i+1}问`} maxLength={5000} value={edit.answers[i]||''} onChange={e=>{const a=[...edit.answers];a[i]=e.target.value;setEdit({...edit,answers:a})}}/>}</Field>)}</div><button className="primary" disabled={busy}>保存12问</button>
-    </form></Modal>}
-    {rule&&current&&<Modal title="新增语感规则" onClose={()=>setRule(null)}><form onSubmit={async e=>{e.preventDefault();const r=await perform(()=>post(`/writers/${current.id}/rules`,rule),'已保存为候选语感');if(r)setRule(null)}}><div className="form-grid"><Field label="改动类型"><select value={rule.kind} onChange={e=>setRule({...rule,kind:e.target.value})}>{Object.entries(KINDS).map(([k,v])=><option key={k} value={k}>{v}</option>)}</select></Field><Field label="规则来源"><select value={rule.source} onChange={e=>setRule({...rule,source:e.target.value})}><option value="manual">人工设定偏好</option><option value="learned">真实改稿学习（需3篇独立证据）</option></select></Field></div>{[['规则说明','title'],['改前例句','before'],['改后例句','after']].map(([label,key])=><Field key={key} label={label}><textarea aria-label={label} required={key==='title'} maxLength={key==='title'?200:1000} rows={2} value={rule[key]} onChange={e=>setRule({...rule,[key]:e.target.value})}/></Field>)}<button className="primary" disabled={busy}>保存候选语感</button></form></Modal>}
-    {evidence&&current&&<Modal title="选择真实改稿证据" onClose={()=>setEvidence(null)}><p>至少3篇独立根内容，且保留不同的改前/改后正文。同素材多版本只算一篇。</p>{drafts.filter(d=>d.ip_id===current.ip_id).map(d=><label className="check-row" key={d.id}><input type="checkbox" checked={evidenceIds.includes(d.id)} onChange={e=>setEvidenceIds(e.target.checked?[...evidenceIds,d.id]:evidenceIds.filter(id=>id!==d.id))}/>{d.title} · v{d.version}</label>)}<button className="primary" disabled={busy||evidenceIds.length<3} onClick={async()=>{const r=await perform(()=>post(`/writers/${current.id}/rules/${evidence.id}/adopt`,{evidence_ids:evidenceIds}),'学习规律已采纳，请更新SKILL');if(r)setEvidence(null)}}>确认采纳学习规律</button></Modal>}
-    {reference&&<Modal title={reference.name+' · 参考模板'} onClose={()=>setReference(null)}><p className="muted">{reference.source}</p><textarea className="context-text" aria-label="参考模板全文" readOnly value={reference.text}/>{reference.kind==='content'?<button className="primary" onClick={()=>{newWriter(reference.id);setReference(null)}}>以此模板新建写手</button>:<Notice>这是辅助分析能力，可在下方“创建内容任务”的写手能力中使用；不直接作为口播文体。</Notice>}</Modal>}
+    <Card title="IP Skill" className="ip-skill-card writer-detail">
+      <form aria-label="IP Skill 配置" className="ip-skill-form" onSubmit={submit}>
+        <div className="ip-skill-select">
+          <Field label="专属写手">
+            <select aria-label="专属写手" value={selectedId} disabled={busy} onChange={event => selectWriter(event.target.value)}>
+              <option value="" disabled>新写手</option>
+              {choices.map(writer => <option key={writer.id} value={writer.id}>{writer.name} · {STATUS[writer.status]}{writer.is_default ? ' · 默认' : ''}</option>)}
+            </select>
+          </Field>
+          <button type="button" disabled={busy} onClick={() => selectWriter('')}><Plus size={16} />新建写手</button>
+        </div>
+
+        <div className="ip-skill-essentials">
+          <Field label="写手名称">
+            <input required disabled={!canEdit || busy} maxLength={80} value={data.name} onChange={event => changeFields({ name: event.target.value })} />
+          </Field>
+          <Field label="所属行业">
+            <input disabled={!canEdit || busy} maxLength={100} value={data.industry} placeholder="例如：保险咨询" onChange={event => { changeFields({ industry: event.target.value }); setSamples(null); }} />
+          </Field>
+          <Field label="基础 Skill">
+            <select aria-label="基础 Skill" disabled={!canEdit || busy || !refs} value={data.skill} onChange={event => { changeFields({ skill: event.target.value }); setSamples(null); }}>
+              {templates.map((template: Row) => <option key={template.id} value={template.id}>{template.name}</option>)}
+            </select>
+          </Field>
+        </div>
+        {canEdit && <button type="button" disabled={busy || !data.industry.trim()} onClick={examples}><Sparkles size={14} />生成参考样例</button>}
+        {samples && <div className="schema-preview">
+          <Notice>{samples.notice} 仅填入空白回答，已有内容保留。</Notice>
+          <details open><summary>查看12问参考样例</summary>{samples.answers.map((answer: string, index: number) => <p key={index}><strong>第{index + 1}问：</strong>{answer}</p>)}</details>
+          <button type="button" onClick={() => {
+            changeFields({ answers: data.answers.map((answer, index) => answer.trim() ? answer : samples.answers[index]) });
+            setSamples(null);
+          }}>仅填入空白项</button>
+        </div>}
+
+        <details className="ip-skill-section" key={current?.id || 'new'}>
+          <summary><span>填写 12 问</span> <small>{completed}/12 已填写</small></summary>
+          <p className="muted">没有的内容可填“无”，尚未核实的事实填“待核实”。</p>
+          {!refs && <p className="muted">正在读取写手问题和基础模板。</p>}
+          <div className="writer-questionnaire">
+            {refs?.questions.map((question: string, index: number) => <Field key={index} label={`${index + 1}. ${question}`}>
+              {index === 10
+                ? <input type="number" min={1} max={10000} aria-label={`第${index + 1}问`} disabled={!canEdit || busy} value={data.answers[index]} onChange={event => changeFields({ answers: data.answers.map((answer, i) => i === index ? event.target.value : answer) })} />
+                : <textarea rows={2} maxLength={5000} aria-label={`第${index + 1}问`} disabled={!canEdit || busy} value={data.answers[index]} onChange={event => changeFields({ answers: data.answers.map((answer, i) => i === index ? event.target.value : answer) })} />}
+            </Field>)}
+          </div>
+        </details>
+
+        <details className="ip-skill-section" key={'knowledge-' + (current?.id || 'new')}>
+          <summary>
+            <span>关联知识</span>{' '}
+            <small>{data.knowledge_ids.length ? `已指定 ${data.knowledge_ids.length} 条` : '自动匹配'}</small>
+            {current?.skill_text && <> <small>生成时匹配 {matchedKnowledge.length} 条</small></>}
+          </summary>
+          {matchedKnowledge.length > 0 && <>
+            <p>生成时匹配的知识</p>
+            <ul className="ip-skill-source-list" aria-label="本次生成匹配的知识">
+              {matchedKnowledge.map(source => <li key={source.id}>
+                <span>{source.title}</span>{source.category_path && <small>{source.category_path}</small>}
+              </li>)}
+            </ul>
+          </>}
+          <p className="muted">写作时自动匹配共享知识。可指定最多 {KNOWLEDGE_LIMIT} 条已核验资料，写作时优先引用。</p>
+          {knowledgeError ? <p className="error-text">知识列表加载失败，请刷新重试。</p> : !knowledgeRows ? <p className="muted">正在加载知识。</p> : null}
+          <div className="ip-skill-knowledge-list">
+            {knowledge.map(doc => {
+              const checked = data.knowledge_ids.includes(doc.id);
+              return <label className="check-row" key={doc.id}>
+                <input type="checkbox" checked={checked} disabled={!canEdit || busy || knowledgeError || (!checked && data.knowledge_ids.length >= KNOWLEDGE_LIMIT)} onChange={event => changeFields({ knowledge_ids: event.target.checked ? [...data.knowledge_ids, doc.id] : data.knowledge_ids.filter(id => id !== doc.id) })} />
+                <span>{doc.title}{doc.category_path && <small className="muted">{doc.category_path}</small>}</span>
+              </label>;
+            })}
+          </div>
+          {staleKnowledge.length > 0 && <div className="button-row">
+            <p className="muted">{staleKnowledge.length} 条已关联资料失效，写作时会跳过。</p>
+            {canEdit && <button type="button" disabled={busy} onClick={() => changeFields({ knowledge_ids: data.knowledge_ids.filter(id => !staleKnowledge.includes(id)) })}>移除失效关联</button>}
+          </div>}
+        </details>
+
+        {noVerifiedKnowledge && matchedKnowledge.length === 0 && <div className="ip-skill-knowledge-empty">
+          <p className="muted">暂无有效的已核验知识，可继续使用填写的写手规则。</p>
+          <button type="button" onClick={() => c.go('knowledge')}>去知识库核验</button>
+        </div>}
+
+        <div className="button-row ip-skill-footer">
+          {canEdit && <>
+            <button type="submit" className={readyToRewrite ? undefined : 'primary'} value="generate" disabled={busy || !refs || !data.name.trim() || completed !== 12 || !validLimit || (knowledgeChanged && staleKnowledge.length > 0)}><Sparkles size={15} />生成 IP Skill</button>
+            {current?.status !== 'active' && <button type="submit" value="draft" disabled={busy || !refs || !data.name.trim() || (knowledgeChanged && staleKnowledge.length > 0)}>保存草稿</button>}
+          </>}
+          {canManage && current?.status === 'compiled' && !changes && <button type="button" className="primary" disabled={busy} onClick={() => command('activate')}>确认启用写手</button>}
+          {current && <span className={'writer-status ' + current.status}>{STATUS[current.status]}</span>}
+          {readyToRewrite && <button type="button" className="primary" onClick={() => onRewrite ? onRewrite(current.id) : c.go('materials')}>去选题库改写 <ArrowRight size={15} /></button>}
+        </div>
+        {current?.status === 'compiled' && <p className="muted">等待管理员或团队长启用后，即可用于改写。</p>}
+        {current?.status === 'stale' && <p className="muted">配置已变更，重新生成后即可用于新任务。</p>}
+      </form>
+    </Card>
+    {current && <WriterManagement key={current.id} c={c} writer={current} drafts={drafts} busy={busy} command={command} />}
+  </>;
+}
+
+interface ManagementProps {
+  c: Ctx;
+  writer: Row;
+  drafts: Row[];
+  busy: boolean;
+  command: (action: string) => Promise<void>;
+}
+
+function WriterManagement({ c, writer, drafts, busy, command }: ManagementProps) {
+  const [rule, setRule] = useState<Row | null>(null);
+  const [evidence, setEvidence] = useState<Row | null>(null);
+  const [evidenceIds, setEvidenceIds] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const canManage = c.me.role !== 'member';
+  const archived = writer.status === 'archived';
+  const rules = (writer.rules || []).filter((entry: Row) => entry.status !== 'archived');
+  const history: Row[] = writer.history || [];
+  const disabled = busy || saving;
+  const rulePath = `/writers/${writer.id}/rules`;
+
+  async function updateRule(path: string, data: Row, message: string) {
+    setSaving(true);
+    try {
+      return await c.run(() => post(path, data), message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <>
+    <details className="ip-skill-management">
+      <summary>查看 Skill 与管理</summary>
+      <p className="muted">{writer.name} · v{writer.version}{writer.is_default ? ' · 当前IP默认' : ''}</p>
+      <div className="button-row">
+        {writer.skill_text && <>
+          <button onClick={async () => {
+            try { await navigator.clipboard.writeText(writer.skill_text); c.notify('SKILL已复制'); }
+            catch { c.notify('复制失败，可选中文本或下载文件'); }
+          }}><Copy size={14} />复制全文</button>
+          <button onClick={() => saveText(writer.name + '-SKILL.md', writer.skill_text)}><Download size={14} />下载</button>
+        </>}
+        {canManage && writer.status === 'active' && !writer.is_default && <button disabled={disabled} onClick={() => command('default')}>设为默认写手</button>}
+        {canManage && !archived && <button disabled={disabled} onClick={() => command('archive')}>归档写手</button>}
+      </div>
+      {writer.skill_text && <textarea className="context-text" aria-label="生成的SKILL" readOnly value={writer.skill_text} />}
+      <details>
+        <summary>历史版本 · {history.length}</summary>
+        {[...history].reverse().map(entry => <details key={entry.version}>
+          <summary>v{entry.version} · {entry.name} · {STATUS[entry.status]}</summary>
+          <pre className="writer-history">{entry.skill_text || '该版本尚无SKILL'}</pre>
+        </details>)}
+      </details>
+      <h3>语感规则</h3>
+      {!archived && <button disabled={disabled} onClick={() => setRule({ kind: 'replace', source: 'manual', title: '', before: '', after: '' })}><Plus size={14} />加一条语感</button>}
+      <div className="writer-rules">
+        {!rules.length && <p className="muted">暂无语感规则。</p>}
+        {rules.map((entry: Row) => <div key={entry.id}>
+          <div className="writer-rule-title"><strong>{entry.title}</strong><span>{KINDS[entry.kind]} · {entry.source === 'manual' ? '人工偏好' : '改稿学习'} · {entry.status === 'adopted' ? '已采纳' : '候选'}</span></div>
+          <p><del>{entry.before || '（无）'}</del> → <ins>{entry.after || '（删除）'}</ins></p>
+          {canManage && !archived && <div className="button-row">
+            {entry.status === 'candidate' && <button disabled={disabled} onClick={() => {
+              if (entry.source === 'learned') { setEvidence(entry); setEvidenceIds([]); }
+              else void updateRule(`${rulePath}/${entry.id}/adopt`, {}, '语感已采纳，请重新生成 Skill');
+            }}>采纳语感</button>}
+            <button disabled={disabled} onClick={() => updateRule(`${rulePath}/${entry.id}/archive`, {}, '语感已归档，请重新生成 Skill')}>归档语感</button>
+          </div>}
+        </div>)}
+      </div>
+    </details>
+    {rule && <Modal title="新增语感规则" onClose={() => setRule(null)}>
+      <form onSubmit={async event => {
+        event.preventDefault();
+        if (await updateRule(rulePath, rule, '已保存为候选语感')) setRule(null);
+      }}>
+        <div className="form-grid">
+          <Field label="改动类型"><select value={rule.kind} onChange={event => setRule({ ...rule, kind: event.target.value })}>{Object.entries(KINDS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Field>
+          <Field label="规则来源"><select value={rule.source} onChange={event => setRule({ ...rule, source: event.target.value })}><option value="manual">人工设定偏好</option><option value="learned">真实改稿学习（需3篇独立证据）</option></select></Field>
+        </div>
+        {[['规则说明', 'title'], ['改前例句', 'before'], ['改后例句', 'after']].map(([label, key]) => <Field key={key} label={label}>
+          <textarea required={key === 'title'} maxLength={key === 'title' ? 200 : 1000} rows={2} value={rule[key]} onChange={event => setRule({ ...rule, [key]: event.target.value })} />
+        </Field>)}
+        <button className="primary" disabled={disabled}>保存候选语感</button>
+      </form>
+    </Modal>}
+    {evidence && <Modal title="选择真实改稿证据" onClose={() => setEvidence(null)}>
+      <p>至少3篇独立内容须保留改前和改后正文，同素材多版本只算一篇。</p>
+      {drafts.filter(draft => draft.history?.some((entry: Row) => entry.body && entry.body !== draft.body)).map(draft => <label className="check-row" key={draft.id}>
+        <input type="checkbox" checked={evidenceIds.includes(draft.id)} onChange={event => setEvidenceIds(event.target.checked ? [...evidenceIds, draft.id] : evidenceIds.filter(id => id !== draft.id))} />{draft.title} · v{draft.version}
+      </label>)}
+      <button className="primary" disabled={disabled || evidenceIds.length < 3} onClick={async () => {
+        if (await updateRule(`${rulePath}/${evidence.id}/adopt`, { evidence_ids: evidenceIds }, '学习规律已采纳，请重新生成 Skill')) setEvidence(null);
+      }}>确认采纳学习规律</button>
+    </Modal>}
   </>;
 }

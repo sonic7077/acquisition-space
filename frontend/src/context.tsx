@@ -6,7 +6,7 @@ export type Ctx = {
   ip: string;
   version: number;
   run: (fn: () => Promise<any>, success?: string) => Promise<any>;
-  go: (p: string) => void;
+  go: (p: string, selectedId?: string) => void;
   notify: (s: string) => void;
 };
 export function useRows(path: string, version: number) {

@@ -115,7 +115,7 @@ def run_once(app):
                 draft.payload = {**draft.payload, 'need_id': ctx['need_id'], 'demand_snapshot': ctx['demand_snapshot']}
             draft.payload = {**draft.payload, **{k:ctx[k] for k in ('writer_snapshot','knowledge_snapshot','material_id','material_snapshot','author_id','comments','evolution_evidence','analysis_draft_snapshot','parent_draft_id','parent_version') if k in ctx}}
             if parsed:
-                draft.payload = {**draft.payload, **parsed, **{k:ctx[k] for k in ('writer_snapshot','word_limit','parent_draft_id','parent_version','root_draft_id','material_id','reference','comments') if k in ctx}, 'original_body': ctx.get('original_body','')}
+                draft.payload = {**draft.payload, **parsed, **{k:ctx[k] for k in ('writer_snapshot','word_limit','parent_draft_id','parent_version','root_draft_id','material_id','reference','transcript_confirmed','comments') if k in ctx}, 'original_body': ctx.get('original_body','')}
             db.add(draft)
             db.flush()
             if result_kind == 'drafts' and ctx.get('material_id'):

@@ -88,6 +88,7 @@ test("管理员完成知识上传、写手、审稿、排期和模型设置", as
   await page
     .getByLabel("目标IP", { exact: true })
     .selectOption({ label: "顾问IP" });
+  await page.getByText("写作与分析", { exact: true }).click();
   await page.getByLabel("内容主题与要求").fill("咨询服务包含哪些内容");
   await page.getByRole("button", { name: "生成上下文预览" }).click();
   await expect(page.getByText(/已引用 [1-9]\d* 条已核验知识/)).toBeVisible();

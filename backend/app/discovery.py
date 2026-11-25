@@ -121,15 +121,18 @@ def score_material(p, author, rules, at=None):
         reasons.append('高评赞比')
     if rising:
         reasons.append('起量')
-    excluded = '博主已停用' if a.get('enabled') is False else '本人账号' if a.get('is_own') else '素材已排除' if p.get('status') == 'excluded' else '作品不可用' if p.get('unavailable') else '超过保鲜期' if freshness == 'stale' else '发布时间待核实' if freshness != 'fresh' else ''
+    status = p.get('status')
+    unavailable = bool(p.get('unavailable'))
+    available = not unavailable and status not in ('excluded', 'adopted') and not p.get('adopted')
+    excluded = '博主已停用' if a.get('enabled') is False else '本人账号' if a.get('is_own') else '素材已排除' if status == 'excluded' else '作品不可用' if unavailable else '超过保鲜期' if freshness == 'stale' else '发布时间待核实' if freshness != 'fresh' else ''
+    recommended = bool(reasons and not excluded)
     reference = .45*math.log2(1+(mult or 0)) + .35*min((ratio or 0)*100, 15)/3 + .2*int(rising)
     return {'version': r['version'], 'multiplier': mult, 'denominator': denom, 'baseline': base, 'sample_count': count,
             'like_level': '未知' if likes is None else '高赞' if likes > r['likes_high'] else '普通' if likes > r['likes_mid'] else '低赞',
             'low_fan_ratio': low_ratio, 'low_fan_hit': low_hit, 'comment_ratio': ratio, 'comment_ratio_level': ratio_level,
             'high_comment_ratio': high_ratio, 'likes_delta': delta, 'observation_seconds': interval, 'rising': rising,
             'freshness': freshness, 'reasons': reasons, 'excluded_reason': excluded,
-            'recommended': bool(reasons and not excluded),
-            'candidate': bool(reasons and not excluded and p.get('status') != 'adopted' and not p.get('adopted')),
+            'available': available, 'recommended': recommended, 'candidate': recommended and available,
             'reference_score': round(reference, 4)}
 
 

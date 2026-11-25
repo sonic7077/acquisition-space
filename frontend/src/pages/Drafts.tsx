@@ -6,11 +6,13 @@ import { type Ctx, useRows, filterIp, IpSelect, verifiedKnowledge } from "../con
 import Teleprompter from "./Teleprompter";
 import RewriteDialog from "./RewriteDialog";
 import MaterialWriterDialog from "./MaterialWriterDialog";
-export default function Drafts(c: Ctx) {
+import { LiveReviewChecks, ReviewChecks } from "./ReviewChecks";
+
+export default function Drafts(c: Ctx & { initialDraftId?: string }) {
   const rows = filterIp(useRows("/drafts", c.version), c.ip),
     skills = useRows("/skills", c.version),
     knowledge = useRows("/knowledge", c.version),
-    [selected, setSelected] = useState(""),
+    [selected, setSelected] = useState(c.initialDraftId || ""),
     [q, setQ] = useState(""),
     [edit, setEdit] = useState<Row | null>(null),
     [target, setTarget] = useState(c.ip),
@@ -82,7 +84,7 @@ export default function Drafts(c: Ctx) {
               </button>
             ))}
           {!rows.length && (
-            <Empty title="还没有稿件" body="创建稿件或从选题库采用素材。" />
+            <Empty title="还没有稿件" body="新建稿件，或从选题库调用写手生成待审稿。" />
           )}
         </Card>
         <Card>
@@ -165,29 +167,7 @@ export default function Drafts(c: Ctx) {
               {current.return_reason && (
                 <p className="error-text">退回原因：{current.return_reason}</p>
               )}
-              <div className="checks">
-                <h3>当前版本检查</h3>
-                {current.checks?.map((r: Row, i: number) => (
-                  <div
-                    key={i}
-                    className={"check-result " + (r.passed ? "pass" : "fail")}
-                  >
-                    <span>{r.passed ? "✓" : "!"}</span>
-                    <div>
-                      {r.name}
-                      {r.ratio !== undefined && (
-                        <small>
-                          命中覆盖率 {(r.ratio * 100).toFixed(1)}%
-                          {r.snippets.length > 0 &&
-                            " · " +
-                              r.snippets.map((s: Row) => s.text).join(" / ")}
-                        </small>
-                      )}
-                    </div>
-                    <Badge value={r.passed ? "通过" : "阻塞"} />
-                  </div>
-                ))}
-              </div>
+              <ReviewChecks checks={current.checks} />
               <div className="draft-history">
                 <h3>历史版本 · {current.history?.length || 0}</h3>
                 {current.history?.map((h: Row) => (
@@ -236,7 +216,8 @@ export default function Drafts(c: Ctx) {
               </Field>
             </div>
             <Field label="标题">
-              <input name="title" required defaultValue={edit.title} />
+              <input name="title" required maxLength={2000} value={edit.title ?? ""}
+                onChange={event => setEdit({ ...edit, title: event.target.value })} />
             </Field>
             <Field label="封面字">
               <input name="cover" defaultValue={edit.cover} />
@@ -244,18 +225,24 @@ export default function Drafts(c: Ctx) {
             <Field label="正文">
               <textarea
                 name="body"
+                aria-label="正文"
                 rows={10}
                 required
-                defaultValue={edit.body}
+                maxLength={20000}
+                value={edit.body ?? ""}
+                onChange={event => setEdit({ ...edit, body: event.target.value })}
               />
             </Field>
-            <Field label="对标逐字稿（复刻必填）">
+            {!edit.reference_restricted && <Field label="对标逐字稿（复刻必填）">
               <textarea
                 name="reference"
+                aria-label="对标逐字稿（复刻必填）"
                 rows={4}
-                defaultValue={edit.reference}
+                maxLength={20000}
+                value={edit.reference ?? ""}
+                onChange={event => setEdit({ ...edit, reference: event.target.value })}
               />
-            </Field>
+            </Field>}
             <fieldset className="field">
               <legend>引用的共享知识（用于变更追踪）</legend>
               {verifiedKnowledge(knowledge)
@@ -280,7 +267,8 @@ export default function Drafts(c: Ctx) {
             <Field label="事实核验状态">
               <select
                 name="fact_status"
-                defaultValue={edit.fact_status || "pending"}
+                value={edit.fact_status || "pending"}
+                onChange={event => setEdit({ ...edit, fact_status: event.target.value })}
               >
                 <option value="pending">包含待核实的具体事实</option>
                 <option value="none">人工确认无具体事实声明</option>
@@ -289,6 +277,16 @@ export default function Drafts(c: Ctx) {
                 )}
               </select>
             </Field>
+            <LiveReviewChecks data={{
+              draft_id: edit.id,
+              version: edit.version,
+              ip_id: target || undefined,
+              skill: edit.skill || "original-video-writer",
+              title: edit.title ?? "",
+              body: edit.body ?? "",
+              reference: edit.reference_restricted ? undefined : edit.reference,
+              fact_status: edit.fact_status || "pending",
+            }} />
             <button className="primary">保存新版本</button>
           </form>
         </Modal>

@@ -242,3 +242,40 @@ def test_candidate_pool_excludes_adopted_but_keeps_recommendation():
     adopted = score_material({**p, 'status': 'adopted'}, {}, DEFAULT_RULES, at)
     assert adopted['recommended'] and not adopted['candidate']
     assert not score_material({**p, 'status': 'excluded'}, {}, DEFAULT_RULES, at)['candidate']
+
+
+def test_retired_search_limits_do_not_disqualify_historical_materials(env):
+    _, client, _, _ = env
+    published_at = datetime.now(timezone.utc).timestamp() - 3600
+    for platform, duration in [('抖音', 2), ('小红书', None)]:
+        response = client.post('/api/records/materials', json={
+            'title': platform, 'platform': platform, 'eligible': False,
+            'likes': 50, 'duration': duration, 'comments_count': 20, 'published_at': published_at,
+        })
+        assert response.status_code == 200, response.text
+
+    def scores():
+        return [record['discovery'] for record in client.get('/api/records/materials').json()]
+
+    initial = scores()
+    assert len(initial) == 2
+    assert all(s['available'] and s['recommended'] and s['candidate'] for s in initial)
+    assert all(s['reasons'] == ['高评赞比'] for s in initial)
+
+    updated = client.put('/api/settings', json={'discovery': {'min_comments': 21}})
+    assert updated.status_code == 200
+    assert all(s['available'] and not s['recommended'] and not s['candidate'] for s in scores())
+
+
+@pytest.mark.parametrize(('changes', 'available', 'recommended', 'candidate'), [
+    ({'unavailable': True}, False, False, False),
+    ({'status': 'excluded'}, False, False, False),
+    ({'status': 'adopted'}, False, True, False),
+    ({'adopted': True}, False, True, False),
+])
+def test_material_availability_and_candidate_respect_source_and_local_status(changes, available, recommended, candidate):
+    from backend.app.discovery import score_material, DEFAULT_RULES
+    at = datetime(2026, 11, 19, tzinfo=timezone.utc)
+    material = {'likes': 100, 'comments_count': 20, 'published_at': at.timestamp() - 86400}
+    score = score_material({**material, **changes}, {}, DEFAULT_RULES, at)
+    assert (score['available'], score['recommended'], score['candidate']) == (available, recommended, candidate)

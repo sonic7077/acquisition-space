@@ -25,6 +25,7 @@ import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
 import Knowledge from "./pages/Knowledge";
 import Writers from "./pages/Writers";
+import { type WriterPreference } from "./pages/MaterialWriterDialog";
 import SettingsPage from "./pages/SettingsPage";
 import UsersPage from "./pages/UsersPage";
 import Records from "./pages/Records";
@@ -80,6 +81,8 @@ export default function App() {
   const [page, setPage] = useState(location.hash.slice(1) || "dashboard"),
     [ips, setIps] = useState<Row[]>([]),
     [ip, setIp] = useState(""),
+    [preferredWriter, setPreferredWriter] = useState<WriterPreference | null>(null),
+    [selectedDraftId, setSelectedDraftId] = useState<string>(),
     [version, setVersion] = useState(0),
     [error, setError] = useState(""),
     [toast, setToast] = useState(""),
@@ -118,7 +121,12 @@ export default function App() {
     window.addEventListener("hashchange", cb);
     return () => window.removeEventListener("hashchange", cb);
   }, []);
-  const go = (next: string) => {
+  useEffect(() => {
+    if (page !== "materials") setPreferredWriter(null);
+  }, [page]);
+  const go = (next: string, selectedId?: string) => {
+    setSelectedDraftId(next === "drafts" ? selectedId : undefined);
+    if (next === "drafts" && selectedId) setIp("");
     location.hash = next;
     setPage(next);
     setError("");
@@ -199,10 +207,10 @@ export default function App() {
             <strong>{title}</strong>
           </div>
           <div className="header-right">
-            <select
+            {page !== "writers" && <select
               aria-label="筛选IP"
               value={ip}
-              onChange={(e) => setIp(e.target.value)}
+              onChange={(e) => { setIp(e.target.value); setPreferredWriter(null); }}
             >
               <option value="">全部授权IP</option>
               {ips.map((i) => (
@@ -210,7 +218,7 @@ export default function App() {
                   {i.name}
                 </option>
               ))}
-            </select>
+            </select>}
             <button
               className="icon-button"
               onClick={refresh}
@@ -232,6 +240,9 @@ export default function App() {
                 run(async () => {
                   await post("/auth/logout", {});
                   setMe(null);
+                  setIps([]);
+                  setIp("");
+                  setPreferredWriter(null);
                 })
               }
             >
@@ -242,7 +253,7 @@ export default function App() {
         <main>
           <div className="page-title">
             <div>
-              <p className="eyebrow">YOUR CONTENT GROWTH WORKSPACE</p>
+              {page !== "writers" && <p className="eyebrow">YOUR CONTENT GROWTH WORKSPACE</p>}
               <h1>{title}</h1>
               <p>
                 {(
@@ -250,18 +261,18 @@ export default function App() {
                     dashboard: "把灵感变成内容，把内容变成客户。",
                     knowledge: "让已有知识成为写手的可靠依据。",
                     settings: "统一管理模型、密钥与外部服务。",
-                    writers: "用你的知识和表达，培养专属写手。",
+                    writers: "结合写手资料、基础 Skill 和知识库，生成可用于素材改写的专属 Skill。",
                   } as Row
                 )[page] || "每一步有记录，让团队协作更清晰。"}
               </p>
             </div>
-            <div className="page-date">
+            {page !== "writers" && <div className="page-date">
               {new Date().toLocaleDateString("zh-CN", {
                 month: "long",
                 day: "numeric",
                 weekday: "long",
               })}
-            </div>
+            </div>}
           </div>
           {error && (
             <div role="alert" className="error-banner">
@@ -279,7 +290,7 @@ export default function App() {
           ) : page === "dashboard" ? (
             <Dashboard {...ctx} />
           ) : page === "materials" ? (
-            <Topics {...ctx} />
+            <Topics {...ctx} preferredWriter={preferredWriter} />
           ) : page === "authors" ? (
             <Authors {...ctx} />
           ) : page === "help" ? (
@@ -289,13 +300,17 @@ export default function App() {
           ) : page === "knowledge" ? (
             <Knowledge {...ctx} />
           ) : page === "writers" ? (
-            <Writers {...ctx} />
+            <Writers {...ctx} onRewrite={(ipId, writerId) => {
+              setIp("");
+              setPreferredWriter({ipId, writerId});
+              go("materials");
+            }} />
           ) : page === "settings" ? (
             <SettingsPage {...ctx} />
           ) : page === "users" ? (
             <UsersPage {...ctx} />
           ) : page === "drafts" ? (
-            <Drafts {...ctx} />
+            <Drafts key={selectedDraftId} {...ctx} initialDraftId={selectedDraftId} />
           ) : page === "assets" ? (
             <Assets {...ctx} />
           ) : page === "schedules" ? (

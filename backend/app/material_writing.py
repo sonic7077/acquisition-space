@@ -5,14 +5,13 @@ from fastapi import Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from .db import Record
-from .knowledge import shared_documents
 from .security import require_ip, require_record, can_record
-from .writing import build_context, reference_context
+from .writing import ORAL_SKILLS, build_context, reference_context, review_word_limit
 from .writer_profiles import get_writer, CONTENT_SKILLS
 from .default_writers import PREFIX,builtin
 from .rewrite import writer_context
 from .demand_analysis import labels,attach_demand
-
+from .integrations.transcript import video_identity
 
 class MaterialInput(BaseModel):
     ip_id:str
@@ -66,9 +65,10 @@ def register(app,get_db,current,audit):
             data.reference[:2000],
             *(comment['body'][:500] for comment in comments[:5]),
         ])
-        ctx=build_context(db.get(Record,data.ip_id),shared_documents(db),(mat.payload.get('title','素材任务')+' '+data.instructions)[:2000],skill,rules,knowledge_query=knowledge_query)
+        ctx=build_context(db.get(Record,data.ip_id),None,(mat.payload.get('title','素材任务')+' '+data.instructions)[:2000],skill,rules)
         source={k:mat.payload.get(k) for k in ('title','body','source','author_id','author','platform')}
-        ctx.update(material_id=material_id,author_id=mat.payload.get('author_id'),comments=comments,reference=data.reference)
+        ctx.update(material_id=material_id,author_id=mat.payload.get('author_id'),comments=comments,
+                   reference=data.reference,transcript_confirmed=bool(data.reference.strip() and data.transcript_confirmed))
         if source_kind=='materials':
             ctx['material_snapshot']=source
         else:
@@ -89,7 +89,20 @@ def register(app,get_db,current,audit):
         if skill=='writer-self-evolve' and len({d['root_id'] for d in evidence})<3:
             ctx['prompt']+='\n缺少3篇独立真实改稿证据，只能提候选建议，不得声称形成长期语感规律。'
         attach_demand(db,user,ctx,data.need_id)
-        ctx=writer_context(db,user,ctx,data.writer_id,data.writer_version)
+        ctx=writer_context(db,user,ctx,data.writer_id,data.writer_version,knowledge_query=knowledge_query)
+        if source_kind == 'materials' and skill in ORAL_SKILLS:
+            settings = db.get(Record, 'system-settings')
+            rules_config = settings.payload.get('rules', {}) if settings else {}
+            minimum = int(rules_config.get('overlap_min', 8))
+            threshold = float(rules_config.get('overlap_max', .08))
+            ctx['word_limit'] = review_word_limit(skill, ctx.get('word_limit'))
+            ctx['prompt'] += (
+                f'\n选题口播审稿要求：标题最多16字，正文最多{ctx["word_limit"]}字。'
+                '重写论述和表达，避免破折号、“评论区”字样和导流话术（打关键词、私信领、加微信等）。'
+                '只有确有适用资料时，结尾自然说明资料价值，不编造赠品或领取渠道。'
+                f'若提供了对标逐字稿，连续{minimum}字及以上相同的片段占正文比例须不超过{threshold:.2%}，'
+                '用本IP的结构与措辞重写整段，不能仅改标点。'
+            )
         if data.enhancement_version is not None and ctx['writer_snapshot'].get('is_system') and ctx['writer_snapshot']['enhancement_version']!=data.enhancement_version:
             raise HTTPException(409,'IP增强规则已变更，请刷新后重新预览')
         return ctx
@@ -119,6 +132,10 @@ def register(app,get_db,current,audit):
                 require_record(db,user,j)
                 return {'id':j.id,'status':j.payload['status']}
         ctx=assemble(db,user,key,data,source_kind)
+        if source_kind == 'materials' and ctx['skill'] in ORAL_SKILLS and not ctx['transcript_confirmed']:
+            material = db.get(Record,key)
+            if data.reference.strip() or video_identity(material.payload):
+                raise HTTPException(422, '请先填写并确认对标逐字稿，再提交口播改写')
         settings=db.get(Record,'system-settings');model=settings.payload.get('model',{}) if settings else {}
         if not model.get('enabled') or not all(model.get(k) for k in ('base_url','model','api_key_encrypted')):raise HTTPException(409,'管理员尚未启用模型，可先预览或导出提示包')
         j=Record(kind='jobs',ip_id=data.ip_id,owner_id=user.id,payload={'status':'queued','context':ctx,'attempts':0,'request_id':data.request_id,'input_hash':digest})

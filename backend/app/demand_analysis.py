@@ -144,8 +144,10 @@ def public_record(db, user, row):
     def allowed_source(key, kind):
         source = db.get(Record, key) if key else None
         return bool(source and source.kind == kind and can_record(db, user, source))
-    if out.get('material_snapshot') and not allowed_source(out.get('material_id'), 'materials'):
+    if out.get('material_id') and (row.kind == 'drafts' or out.get('material_snapshot')) and not allowed_source(out['material_id'], 'materials'):
         out.pop('material_snapshot', None)
+        out.pop('reference', None)
+        out['reference_restricted'] = True
         out['source_evidence_restricted'] = True
     if out.get('comments'):
         visible_comments = [c for c in out['comments'] if allowed_source(c.get('id'), 'leads')]

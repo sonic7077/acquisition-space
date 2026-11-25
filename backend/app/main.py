@@ -17,7 +17,7 @@ from sqlalchemy import select, func
 from .db import User, LoginSession, Record, database, now, uid, as_record, business_today
 from .security import password_hash, password_ok, public_user, admin_only, approver, active_ip, can_ip, require_ip, SecretStore, ROLES, can_record, require_record
 from .knowledge import expand_uploads, MAX_FILE, shared_documents, template_text, verified_document
-from .writing import SKILLS, build_context, checks
+from .writing import SKILLS, build_context, checks, transcript_available
 from .demand_analysis import labels, patch_labels, demand_view, demand_snapshot, attach_demand, public_record
 from .discovery import DEFAULT_RULES, rules_for, validate_rules, author_patch, discovery_records
 from .validation import record_input, text_fields
@@ -57,6 +57,17 @@ class ContextInput(BaseModel):
     writer_id: str | None = None
     writer_version: int | None = None
     need_id: str | None = None
+
+
+class ReviewCheckInput(BaseModel):
+    draft_id: str | None = None
+    version: int | None = None
+    ip_id: str | None = None
+    skill: str = 'original-video-writer'
+    title: str = Field(default='', max_length=2000)
+    body: str = Field(default='', max_length=20000)
+    reference: str = Field(default='', max_length=20000)
+    fact_status: Literal['none', 'pending', 'verified'] = 'pending'
 
 
 def create_app(data_dir=None):
@@ -111,13 +122,16 @@ def create_app(data_dir=None):
                 db.rollback()
                 raise
 
-    def current(request: Request, db=Depends(get_db)):
+    def authenticated_user(request: Request, db):
         token = request.cookies.get('session')
         sess = db.get(LoginSession, hashlib.sha256(token.encode()).hexdigest()) if token else None
         user = db.get(User, sess.user_id) if sess and sess.expires_at > now() else None
         if not user or not user.active:
             raise HTTPException(401, '请先登录')
         return user
+
+    def current(request: Request, db=Depends(get_db)):
+        return authenticated_user(request, db)
 
     def audit(db, user, action, object_id=None):
         db.add(Record(kind='audit', owner_id=user.id if user else None, payload={'actor': user.name if user else '初始化', 'action': action, 'object_id': object_id}))
@@ -477,7 +491,7 @@ def create_app(data_dir=None):
         if data.skill not in SKILLS:
             raise HTTPException(422, '未知写手能力')
         ip = db.get(Record, data.ip_id)
-        docs = shared_documents(db)
+        docs = None if data.writer_id else shared_documents(db)
         rules = [r.payload for r in visible(db, user, 'rules') if r.ip_id == data.ip_id and r.payload.get('status') == 'adopted']
         ctx = build_context(ip, docs, data.topic, data.skill, rules)
         attach_demand(db, user, ctx, data.need_id)
@@ -523,7 +537,12 @@ def create_app(data_dir=None):
             raise HTTPException(404, '页面不存在')
         if kind in ('materials', 'authors'):
             materials, authors = discovery_records(visible(db, user, 'materials'), visible(db, user, 'authors'), rules_for(setting_data(db)))
-            return materials if kind == 'materials' else authors
+            if kind == 'authors':
+                return authors
+            from .integrations.transcript import video_identity
+            for material in materials:
+                material['transcript_supported'] = bool(video_identity(material))
+            return materials
         return [demand_view(db, user, r) if kind == 'needs' else ({**as_record(r), **labels(r.payload)} if kind == 'leads' else as_record(r)) for r in visible(db, user, kind)]
 
     @app.post('/api/records/{kind}')
@@ -576,16 +595,16 @@ def create_app(data_dir=None):
             raise HTTPException(422, '未知写手能力')
         for draft in visible(db, user, 'drafts'):
             if draft.ip_id == target_ip and draft.payload.get('material_id') == key and draft.payload.get('skill') == skill:
-                return as_record(draft)
+                return draft_review(db, user, draft, setting_data(db).get('rules', {}))
         if mat.payload.get('source') and not mat.payload.get('author_id'):
             existing = [r for r in visible(db, user, 'authors') if r.ip_id == mat.ip_id and r.payload.get('source') == mat.payload['source']]
             if not existing:
                 db.add(Record(kind='authors', ip_id=mat.ip_id, owner_id=user.id, payload={'title': mat.payload.get('author', '素材来源作者'), 'source': mat.payload['source'], 'status': 'confirmed', 'body': '由明确采用操作加入对标池'}))
-        row = Record(kind='drafts', ip_id=target_ip, owner_id=user.id, payload={'title': mat.payload['title'][:16], 'body': '', 'reference': mat.payload.get('body', ''), 'skill': skill, 'material_id': key, 'version': 1, 'approved_version': None, 'status': 'pending', 'fact_status': 'pending', 'history': []})
+        row = Record(kind='drafts', ip_id=target_ip, owner_id=user.id, payload={'title': mat.payload['title'][:16], 'body': '', 'reference': mat.payload.get('body', ''), 'transcript_confirmed': False, 'skill': skill, 'material_id': key, 'version': 1, 'approved_version': None, 'status': 'pending', 'fact_status': 'pending', 'history': []})
         db.add(row)
         db.flush()
         mat.payload = {**mat.payload, 'status': 'adopted'}
-        return public_record(db, user, row)
+        return draft_review(db, user, row, setting_data(db).get('rules', {}))
 
     @app.post('/api/rules/{key}/adopt')
     def adopt_rule(key: str, data: dict, user=Depends(current), db=Depends(get_db)):
@@ -617,7 +636,50 @@ def create_app(data_dir=None):
     @app.get('/api/drafts')
     def drafts(user=Depends(current), db=Depends(get_db)):
         config = setting_data(db).get('rules', {})
-        return [{**public_record(db, user, r), 'checks': checks(r.payload, config)} for r in visible(db, user, 'drafts')]
+        return [draft_review(db, user, r, config) for r in visible(db, user, 'drafts')]
+
+    def can_review_transcript(db, user, payload):
+        material_id = payload.get('material_id')
+        if not material_id:
+            return True
+        material = db.get(Record, material_id)
+        return material is not None and material.kind == 'materials' and can_record(db, user, material)
+
+    def review_checks(payload, config, reference_restricted):
+        if not reference_restricted:
+            return checks(payload, config)
+        result = checks({**payload, 'reference': ''}, config)
+        result[-1] = {**result[-1], 'state': 'restricted'}
+        return result
+
+    def draft_review(db, user, row, config):
+        output = public_record(db, user, row)
+        if not transcript_available(row.payload):
+            output.pop('reference', None)
+        output['checks'] = review_checks(row.payload, config, output.get('reference_restricted'))
+        return output
+
+    @app.post('/api/drafts/checks')
+    def preview_draft_checks(data: ReviewCheckInput, request: Request):
+        with Session() as db:
+            user = authenticated_user(request, db)
+            if data.draft_id:
+                row = row_for(db, user, data.draft_id, 'drafts')
+                if data.version != row.payload['version']:
+                    raise HTTPException(409, '稿件已经变更，请刷新后对比再保存')
+                payload = row.payload
+            else:
+                require_ip(db, user, data.ip_id)
+                if data.skill not in SKILLS:
+                    raise HTTPException(422, '未知写手能力')
+                payload = {'skill': data.skill, 'fact_status': 'pending'}
+            edits = data.model_dump(exclude_unset=True, include={'title', 'body', 'reference', 'fact_status'})
+            restricted = not can_review_transcript(db, user, payload)
+            if 'reference' in edits:
+                if restricted:
+                    raise HTTPException(403, '没有对标素材的访问权限')
+                edits['transcript_confirmed'] = bool(edits['reference'].strip())
+            return {'checks': review_checks({**payload, **edits}, setting_data(db).get('rules', {}), restricted)}
 
     @app.post('/api/drafts')
     def create_draft(data: dict, user=Depends(current), db=Depends(get_db)):
@@ -651,7 +713,7 @@ def create_app(data_dir=None):
     @app.get('/api/drafts/{key}')
     def draft_detail(key: str, user=Depends(current), db=Depends(get_db)):
         row = row_for(db, user, key, 'drafts')
-        return {**public_record(db, user, row), 'checks': checks(row.payload, setting_data(db).get('rules', {}))}
+        return draft_review(db, user, row, setting_data(db).get('rules', {}))
 
     @app.patch('/api/drafts/{key}')
     def edit_draft(key: str, data: dict, user=Depends(current), db=Depends(get_db)):
@@ -664,6 +726,10 @@ def create_app(data_dir=None):
         history = list(row.payload.get('history', []))
         history.append({k: row.payload.get(k) for k in ('version', 'title', 'body', 'fact_status')})
         patch = {k: v for k, v in data.items() if k in ('title', 'body', 'reference', 'cover', 'fact_status')}
+        if 'reference' in patch:
+            if not can_review_transcript(db, user, row.payload):
+                raise HTTPException(403, '没有对标素材的访问权限')
+            patch['transcript_confirmed'] = bool(patch['reference'].strip())
         if 'source_ids' in data:
             source_ids = list(set(data['source_ids']))
             for source_id in source_ids:
@@ -683,7 +749,7 @@ def create_app(data_dir=None):
         row.updated_at = now()
         invalidate_schedules(db, {key})
         audit(db, user, '修改稿件并撤销旧批准', key)
-        return public_record(db, user, row)
+        return draft_review(db, user, row, setting_data(db).get('rules', {}))
 
     @app.post('/api/drafts/{key}/approve')
     def approve(key: str, data: dict, user=Depends(current), db=Depends(get_db)):
@@ -700,7 +766,7 @@ def create_app(data_dir=None):
             raise HTTPException(409, '稿件存在阻塞检查项，请先修正或核实事实')
         row.payload = {**row.payload, 'approved_version': row.payload['version'], 'status': 'approved', 'approved_by': user.id, 'approved_at': now()}
         audit(db, user, '批准稿件', key)
-        return public_record(db, user, row)
+        return draft_review(db, user, row, setting_data(db).get('rules', {}))
 
     @app.post('/api/drafts/{key}/return')
     def return_draft(key: str, data: dict, user=Depends(current), db=Depends(get_db)):
@@ -711,7 +777,7 @@ def create_app(data_dir=None):
         row.payload = {**row.payload, 'status': 'returned', 'approved_version': None, 'return_reason': data['reason']}
         invalidate_schedules(db, {key})
         audit(db, user, '退回稿件', key)
-        return public_record(db, user, row)
+        return draft_review(db, user, row, setting_data(db).get('rules', {}))
 
     @app.get('/api/assets')
     def assets(user=Depends(current), db=Depends(get_db)):
@@ -918,6 +984,8 @@ def create_app(data_dir=None):
     register_defaults(app, get_db, current, audit)
     from .material_writing import register as register_material_writing
     register_material_writing(app, get_db, current, audit)
+    from .integrations.transcript import register as register_transcript
+    register_transcript(app, audit, authenticated_user)
     from .rewrite import register as register_rewrite
     register_rewrite(app, get_db, current, audit)
 

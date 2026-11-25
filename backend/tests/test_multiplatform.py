@@ -58,8 +58,6 @@ def test_default_collection_options_match_new_saved_search_options(env):
         'platforms': ['douyin', 'xiaohongshu'],
         'keywords': '咨询服务',
         'pages': 1,
-        'min_likes': 0,
-        'min_duration': 0,
         'max_videos': 20,
         'per_word_limit': 10,
         'comment_pages': 1,
@@ -105,6 +103,12 @@ def test_three_platform_search_without_ip_automatically_imports_comments(env):
     app,c,team,ip=env; seen=[]
     app.state.integration_transport=httpx.MockTransport(lambda r:(seen.append(r.url.path) or transport(r)))
     key=start(c,platforms=['douyin','xiaohongshu','wechat_channels'],min_likes=300,min_duration=30)
+    with app.state.Session() as db:
+        job = db.get(Record, key)
+        assert 'min_likes' not in job.payload['options'] and 'min_duration' not in job.payload['options']
+        # Older queued jobs and retries can still contain the retired settings.
+        job.payload = {**job.payload, 'options': {**job.payload['options'], 'min_likes': 300, 'min_duration': 30}}
+        db.commit()
     run_collection_job(app,key)
     run=c.get('/api/collection/runs').json()[0]
     assert run['status']=='completed',run
@@ -117,7 +121,7 @@ def test_three_platform_search_without_ip_automatically_imports_comments(env):
     assert all(l['contactable'] is False for l in leads)
     assert 'decode_key' not in json.dumps(mats)
     wc=next(m for m in mats if m['platform']=='视频号');assert wc['platform_id']=='14941130915890399732'
-    assert next(m for m in mats if m['platform']=='抖音')['eligible'] is False
+    assert all('eligible' not in m and m['discovery']['available'] for m in mats)
     assert 'xiaohongshu' in c.get('/api/collection/status').json()['platform_ids']
 
 

@@ -137,9 +137,11 @@ def knowledge_terms(text):
     return terms
 
 
-def search_documents(documents, topic, limit=8, *, detail='', preferred_groups=()):
+def search_documents(documents, topic, limit=8, *, detail='', preferred_groups=(), pinned_ids=(), preferred_ids=()):
     topic_terms = knowledge_terms(topic)
     detail_terms = knowledge_terms(detail[:6000]) - topic_terms
+    pinned_order = {key: order for order, key in enumerate(pinned_ids)}
+    preferred_ids = set(preferred_ids)
     ranked = []
     for doc in documents:
         if not verified_document(doc):
@@ -151,16 +153,17 @@ def search_documents(documents, topic, limit=8, *, detail='', preferred_groups=(
         all_terms = heading | body_terms
         score = (len(topic_terms & all_terms) * 4 + len(topic_terms & heading) * 3
                  + min(len(detail_terms & all_terms), 12) + min(len(detail_terms & heading), 8))
-        if not score:
+        if not score and doc.id not in pinned_order:
             continue
         group = (p.get('category_id') or '').partition('-')[0]
-        preferred = group in preferred_groups
+        score += 2 * (int(group in preferred_groups) + int(doc.id in preferred_ids))
         lower = text.lower()
         excerpt_terms = (topic_terms & body_terms) or (detail_terms & body_terms)
         positions = [lower.find(term) for term in excerpt_terms]
         start = max(0, min(positions, default=0) - 200)
-        ranked.append((score + int(preferred) * 2, doc, text[start:start + 5000]))
-    ranked.sort(key=lambda item: (-item[0], item[1].id))
+        order = (pinned_order.get(doc.id, len(pinned_order)), -score, doc.id)
+        ranked.append((order, doc, text[start:start + 5000]))
+    ranked.sort(key=lambda item: item[0])
     sources, seen = [], set()
     for _, doc, excerpt in ranked:
         p = doc.payload

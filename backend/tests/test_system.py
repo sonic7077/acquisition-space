@@ -350,6 +350,108 @@ def test_overlap_counts_every_occurrence_without_double_count():
     assert sum(x['length'] for x in report['snippets']) == 22
 
 
+def test_oral_review_rules_preserve_configured_limit_and_flag_phrases():
+    from backend.app.writing import checks
+    payload = {
+        'title': '这是一个刻意写到十六个字以上的口播标题',
+        'body': '先看条款——然后到评 论 区打「保障」关键词，私信领取资料。',
+        'skill': 'viral-rewrite-writer',
+        'fact_status': 'none',
+        'word_limit': 2000,
+    }
+    report = {rule['id']: rule for rule in checks(payload)}
+    assert report['title_length']['passed'] is False
+    assert report['title_length']['limit'] == 16
+    assert report['body_length']['limit'] == 1500
+    assert report['dash']['passed'] is False
+    assert report['comments_phrase']['passed'] is False
+    assert report['traffic']['passed'] is False and report['traffic']['blocking']
+    assert report['resource_hook']['passed'] is False and not report['resource_hook']['blocking']
+    valid = {rule['id']: rule for rule in checks({
+        **payload,
+        'body': '先比对这两项。 我把核对步骤整理成了一份《家庭保单检查清单》，里面有三个检查项。',
+        'word_limit': 700,
+    })}
+    assert valid['resource_hook']['passed'] is True
+    assert valid['traffic']['passed'] is True
+    assert valid['body_length']['limit'] == 700
+    non_oral = {rule['id'] for rule in checks({**payload, 'skill': 'gzh-writer', 'word_limit': 2500})}
+    assert 'resource_hook' not in non_oral and 'traffic' not in non_oral
+
+
+def test_live_review_preview_uses_saved_rules_and_does_not_modify_draft(env):
+    app, admin, users, ip, team = env
+    saved = admin.post('/api/drafts', json={
+        'ip_id': ip['id'], 'title': '逐字稿核对', 'body': '甲乙丙丁，戊己庚辛。',
+        'reference': '甲乙丙丁戊己庚辛', 'skill': 'viral-rewrite-writer',
+    }).json()
+    endpoint = '/api/drafts/checks'
+    source = {'draft_id': saved['id'], 'version': saved['version']}
+    assert TestClient(app).post(endpoint, json=source).status_code == 401
+    assert users['member'].post(endpoint, json={**source, 'version': 2}).status_code == 409
+    editing = {**source, 'body': saved['body'] + '壬' * 92}
+    preview = users['member'].post(endpoint, json=editing)
+    assert preview.status_code == 200, preview.text
+    overlap = preview.json()['checks'][-1]
+    assert overlap['state'] == 'compared'
+    assert overlap['ratio'] == overlap['threshold'] == .08
+    assert overlap['passed'] and overlap['min_match'] == 8
+    assert overlap['snippets'] == [{'text': '甲乙丙丁戊己庚辛', 'length': 8, 'sentence': saved['body']}]
+    assert admin.get('/api/drafts/' + saved['id']).json()['body'] == saved['body']
+    assert admin.post(f"/api/drafts/{saved['id']}/approve", json={'version': 1}).status_code == 409
+    assert admin.put('/api/settings', json={'rules': {'overlap_min': 9, 'overlap_max': .07}}).status_code == 200
+    changed = users['member'].post(endpoint, json=editing).json()['checks'][-1]
+    assert changed['min_match'] == 9 and changed['threshold'] == .07
+    assert changed['ratio'] == 0 and changed['snippets'] == []
+
+
+def test_legacy_material_description_waits_for_real_reference(env):
+    app, admin, users, ip, team = env
+    body = '只有作品描述不宜当作逐字稿'
+    material = admin.post('/api/records/materials', json={
+        'ip_id': ip['id'], 'title': '作品描述', 'body': body,
+    }).json()
+    saved = admin.post(f"/api/materials/{material['id']}/adopt", json={
+        'skill': 'viral-rewrite-writer',
+    }).json()
+    endpoint = '/api/drafts/checks'
+    source = {'draft_id': saved['id'], 'version': 1, 'body': body}
+    report = admin.post(endpoint, json=source).json()['checks'][-1]
+    assert report['state'] == 'missing_reference'
+    assert report['ratio'] is None and report['blocking']
+    report = admin.post(endpoint, json={**source, 'reference': '这是已核实的来源逐字稿'}).json()['checks'][-1]
+    assert report['state'] == 'compared' and report['ratio'] == 0
+
+
+def test_review_does_not_expose_reference_from_another_members_material(env):
+    from backend.app.db import Record
+
+    app, admin, users, ip, team = env
+    private_reference = '只有有权访问作者才能看到的逐字稿'
+    material = admin.post('/api/records/materials', json={'title': '私有素材'}).json()
+    with app.state.Session.begin() as db:
+        row = Record(kind='drafts', ip_id=ip['id'], payload={
+            'title': '团队稿', 'body': private_reference, 'material_id': material['id'],
+            'reference': private_reference, 'transcript_confirmed': True,
+            'fact_status': 'none', 'skill': 'viral-rewrite-writer', 'version': 1,
+        })
+        db.add(row)
+        db.flush()
+        draft_id = row.id
+    endpoint = '/api/drafts/' + draft_id
+    member = users['member']
+    assert admin.get(endpoint).json()['reference'] == private_reference
+    visible = member.get(endpoint).json()
+    assert 'reference' not in visible and visible['reference_restricted']
+    report = visible['checks'][-1]
+    assert report['state'] == 'restricted' and report['snippets'] == [] and report['ratio'] is None
+    edits = {'version': 1, 'reference': '伪造来源'}
+    assert member.post('/api/drafts/checks', json={**edits, 'draft_id': draft_id}).status_code == 403
+    assert member.patch(endpoint, json=edits).status_code == 403
+    assert member.patch(endpoint, json={'version': 1, 'body': '修订团队稿件'}).status_code == 200
+    assert admin.get(endpoint).json()['reference'] == private_reference
+
+
 def test_settings_reject_invalid_configuration_types(env):
     app, admin, users, ip, team = env
     assert admin.put('/api/settings', json={'model': {'enabled': 'false'}}).status_code == 422

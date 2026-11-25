@@ -172,7 +172,6 @@ class Collector:
                                         author_row=upsert(db,'authors',self.run['ip_id'],self.run['owner_id'],a['platform_id'],a)
                                         authors[author_row.id]=as_record(author_row)
                                     m.update({'author_id':author_row.id if author_row else None,'keyword':keyword,'collected_at':now(),
-                                              'eligible':(m['likes'] or 0)>=opts['min_likes'] and (m['duration'] or 0)>=opts['min_duration'] and not m['unavailable'],
                                               'comments_status':'pending'})
                                     row=upsert(db,'materials',self.run['ip_id'],self.run['owner_id'],m['platform_id'],m)
                                     material=as_record(row)

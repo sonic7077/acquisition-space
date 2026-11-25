@@ -36,8 +36,9 @@ test('评论双标签整理需求，原话、透明评分与写手上下文关�
   await expect(rewrite.getByLabel('改编提示包',{exact:true})).toContainText('家庭预算多少钱？');
   await rewrite.getByRole('button',{name:'关闭',exact:true}).click();
   await page.getByRole('button',{name:'IP与写手',exact:true}).click();
+  await page.getByLabel('目标IP',{exact:true}).selectOption(ip.id);
+  await page.getByText('写作与分析',{exact:true}).click();
   const writing=page.locator('.card').filter({has:page.getByRole('heading',{name:'创建内容任务',exact:true})});
-  await writing.getByLabel('目标IP',{exact:true}).selectOption(ip.id);
   await writing.getByLabel('关联需求（可选）',{exact:true}).selectOption(draft.need_id);
   await writing.getByLabel('内容主题与要求',{exact:true}).fill('回答咨询费用问题');
   await writing.getByRole('button',{name:'生成上下文预览',exact:true}).click();

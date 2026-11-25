@@ -10,7 +10,7 @@ from .db import Record,as_record
 from .security import require_record
 from .knowledge import shared_documents
 from .writer_profiles import CONTENT_SKILLS, FORMAT_REFERENCE_HEADING, get_writer, revision
-from .writing import build_context, reference_context
+from .writing import attach_knowledge, build_context, reference_context
 from .demand_analysis import attach_demand, labels
 
 class RewriteInput(BaseModel):
@@ -26,15 +26,27 @@ class RewriteInput(BaseModel):
     request_id:str=Field(default='',max_length=100)
 
 
-def writer_context(db,user,ctx,writer_id,writer_version):
+def writer_context(db,user,ctx,writer_id,writer_version,*,knowledge_query=''):
+    demand = ctx.get('demand_snapshot', {})
+    demand_terms = '\n'.join(demand.get(field) or '' for field in ('title', 'body', 'sel_topic', 'doc_name', 'product')).strip()
+    if demand_terms:
+        knowledge_query = demand_terms[:1500] + '\n' + knowledge_query
     if writer_id.startswith('default:'):
         from .default_writers import apply_context
+        attach_knowledge(ctx, shared_documents(db), knowledge_query=knowledge_query)
         return apply_context(db,user,ctx,writer_id,writer_version)
     row=get_writer(db,user,writer_id);revision(row,writer_version)
     if row.ip_id!=ctx['ip_id']:raise HTTPException(422,'写手必须属于稿件目标IP')
     if row.payload['status']!='active':raise HTTPException(409,'请先生成并启用可用写手')
     if ctx['skill'] not in CONTENT_SKILLS:raise HTTPException(422,'请选择内容写作文体')
     p=row.payload
+    attach_knowledge(ctx, shared_documents(db), knowledge_query=knowledge_query,
+                     pinned_ids=p.get('knowledge_ids', []),
+                     preferred_ids=[source['id'] for source in p.get('knowledge_sources', [])])
+    sources = [{k: source[k] for k in ('id', 'title', 'hash', 'category_id', 'category_path')}
+               for source in ctx['sources']]
+    ctx['knowledge_snapshot'] = {'documents': sources, 'count': len(sources),
+                                 'fingerprint': hashlib.sha256(json.dumps(sources, sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
     snapshot={k:copy.deepcopy(p[k]) for k in ('name','version','answers','skill_text','word_limit','skill')}
     snapshot.update(id=row.id,ip_id=row.ip_id)
     limit=p['word_limit'] if ctx['skill'] in ('viral-rewrite-writer','original-video-writer') else {'gzh-writer':2500,'tietu-writer':500,'moments-writer':150}[ctx['skill']]
@@ -98,13 +110,14 @@ def register(app,get_db,current,audit):
             data.reference[:2000],
             *(comment['body'][:500] for comment in comments[:5]),
         ])
-        ctx=build_context(ip,shared_documents(db),topic,data.skill,rules,knowledge_query=knowledge_query)
-        ctx.update(parent_draft_id=row.id,parent_version=row.payload['version'],root_draft_id=row.payload.get('root_draft_id') or row.id,material_id=row.payload.get('material_id'),reference=data.reference,comments=comments,original_body=row.payload.get('body',''))
+        ctx=build_context(ip,None,topic,data.skill,rules)
+        ctx.update(parent_draft_id=row.id,parent_version=row.payload['version'],root_draft_id=row.payload.get('root_draft_id') or row.id,material_id=row.payload.get('material_id'),reference=data.reference,
+                   transcript_confirmed=bool(data.reference.strip() and data.transcript_confirmed),comments=comments,original_body=row.payload.get('body',''))
         ctx['prompt']+='\n原稿（仅作表达参考，不自动视为事实）：\n'+row.payload.get('body','')
         ctx['prompt']+=reference_context(data.reference,data.transcript_confirmed)
         ctx['prompt']+='\n已选择的评论（只作洞察，不作为事实证据）：\n'+json.dumps(comments,ensure_ascii=False)+'\n改编要求：'+data.instructions
         attach_demand(db,user,ctx,data.need_id if 'need_id' in data.model_fields_set else row.payload.get('need_id'))
-        return writer_context(db,user,ctx,data.writer_id,data.writer_version)
+        return writer_context(db,user,ctx,data.writer_id,data.writer_version,knowledge_query=knowledge_query)
 
     @app.post('/api/drafts/{key}/rewrite/context')
     def preview(key:str,data:RewriteInput,user=Depends(current),db=Depends(get_db)):

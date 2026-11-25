@@ -41,7 +41,7 @@ const CONFIG: Record<
   },
   transcription: {
     name: "语音转写",
-    desc: "登记转写模型；当前上传文件使用明确稿件匹配。",
+    desc: "选题库优先使用本机 Whisper 转写视频语音。也可配置兼容 /audio/transcriptions 的备用服务。",
     fields: [
       ["base_url", "服务地址"],
       ["model", "转写模型名称"],

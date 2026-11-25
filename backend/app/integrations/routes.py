@@ -16,8 +16,6 @@ class SearchInput(BaseModel):
     platforms: list[Literal['douyin', 'xiaohongshu', 'wechat_channels']] = Field(default=['douyin', 'xiaohongshu'], min_length=1, max_length=3)
     keywords: str = Field(min_length=1, max_length=300)
     pages: int = Field(default=1, ge=1, le=5)
-    min_likes: int = Field(default=0, ge=0, le=100000000)
-    min_duration: int = Field(default=0, ge=0, le=36000)
     max_videos: int = Field(default=20, ge=1, le=20)
     per_word_limit: int = Field(default=10, ge=1, le=20)
     comment_pages: int = Field(default=1, ge=1, le=5)

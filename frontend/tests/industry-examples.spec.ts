@@ -6,12 +6,12 @@ test('行业样例预览只补空白项并随写手保存',async({page,request})
   const ip=await(await request.post('/api/ips',{data:{name:'行业样例IP',team_id:team.id}})).json();
   await page.goto('/');await page.getByRole('button',{name:'进入工作台'}).click();
   await page.getByRole('button',{name:'IP与写手',exact:true}).click();
-  await page.getByRole('button',{name:'新建写手',exact:true}).click();
-  const modal=page.getByRole('dialog',{name:'新建专属写手'});
+  await page.getByLabel('目标IP',{exact:true}).selectOption(ip.id);
+  const modal=page.getByRole('form',{name:'IP Skill 配置'});
   await modal.getByLabel('写手名称',{exact:true}).fill('装修参考写手');
-  await modal.getByLabel('写手所属IP',{exact:true}).selectOption(ip.id);
   await expect(modal.getByRole('button',{name:'生成参考样例',exact:true})).toBeDisabled();
   await modal.getByLabel('所属行业',{exact:true}).fill('家装设计');
+  await modal.getByText('填写 12 问',{exact:true}).click();
   await modal.getByLabel('第1问',{exact:true}).fill('我已填写的真实身份');
   await modal.getByRole('button',{name:'生成参考样例',exact:true}).click();
   await expect(modal.getByRole('button',{name:'仅填入空白项',exact:true})).toBeVisible();
@@ -22,10 +22,10 @@ test('行业样例预览只补空白项并随写手保存',async({page,request})
   await expect(modal.getByLabel('第3问',{exact:true})).toHaveValue('预览期间补充的真实产品');
   await expect(modal.getByLabel('第2问',{exact:true})).toHaveValue(/装修/);
   await expect(modal.getByLabel('第11问',{exact:true})).toHaveValue('600');
-  await modal.getByRole('button',{name:'保存12问',exact:true}).click();
-  await expect(modal).not.toBeVisible();
-  await page.getByRole('button',{name:'修改12个回答',exact:true}).click();
-  await expect(page.getByRole('dialog').getByLabel('所属行业',{exact:true})).toHaveValue('家装设计');
+  await modal.getByRole('button',{name:'保存草稿',exact:true}).click();
+  await expect(page.getByRole('status')).toContainText('草稿');
+  const writers=await(await request.get('/api/writers')).json();
+  expect(writers.find((writer:{ip_id:string})=>writer.ip_id===ip.id)?.industry).toBe('家装设计');
 });
 
 test('管理员选择CLI认证并显示明确的权限不足提示',async({page})=>{

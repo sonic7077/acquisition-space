@@ -67,12 +67,15 @@ test('飞书三表字段预览与准备入口只展示映射结果',async({page}
 test('默认全部和平台过滤，搜索无需IP，未归属素材写稿时选IP',async({page,request})=>{
   await request.post('/api/auth/login',{data:{username:'admin',password:'admin'}});
   const ips=await(await request.get('/api/ips')).json();
-  let submitted:any,adopted:any;
+  let submitted:any,transcriptRequests=0;
   await page.route('**/api/collection/status',r=>r.fulfill({json:{enabled:true,configured:true,today_calls:0,daily_budget:100}}));
   await page.route('**/api/collection/runs',r=>r.fulfill({json:[]}));
-  await page.route('**/api/records/materials',r=>r.fulfill({json:[{id:'unassigned-xhs',ip_id:null,platform:'小红书',title:'低赞笔记也展示',likes:1,eligible:false,comments_status:'completed',collected_comments:2,status:'new'},{id:'wx-work',ip_id:null,platform:'视频号',title:'视频号内容',likes:200,status:'excluded'}]}));
+  await page.route('**/api/records/materials',r=>r.fulfill({json:[{id:'unassigned-xhs',ip_id:null,platform:'小红书',transcript_supported:true,title:'低赞笔记也展示',likes:1,eligible:false,comments_status:'completed',collected_comments:2,status:'new'},{id:'wx-work',ip_id:null,platform:'视频号',title:'视频号内容',likes:200,status:'excluded'}]}));
   await page.route('**/api/collection/search',async r=>{submitted=r.request().postDataJSON();await r.fulfill({json:{id:'unassigned-run'}})});
-  await page.route('**/api/materials/unassigned-xhs/adopt',async r=>{adopted=r.request().postDataJSON();await r.fulfill({json:{id:'new-draft'}})});
+  await page.route('**/api/materials/unassigned-xhs/transcript',r=>{
+    transcriptRequests++;
+    return r.fulfill({json:{text:'这段话来自原视频的转写。',source:'speech_recognition',cached:false}});
+  });
   await page.goto('/');await page.getByRole('button',{name:'进入工作台'}).click();await page.getByRole('button',{name:'选题库',exact:true}).click();
   await expect(page.getByText('低赞笔记也展示',{exact:true})).toBeVisible();
   await expect(page.getByText('视频号内容',{exact:true})).toBeVisible();
@@ -84,11 +87,41 @@ test('默认全部和平台过滤，搜索无需IP，未归属素材写稿时选
   await expect(page.getByLabel('归属IP（可选）',{exact:true})).not.toHaveAttribute('required','');
   await page.getByRole('button',{name:'搜索并自动入库',exact:true}).click();
   await expect.poll(()=>submitted?.ip_id===null).toBe(true);expect(submitted.platforms).toEqual(['xiaohongshu']);
-  await page.getByRole('button',{name:'加入写稿',exact:true}).click();
-  await expect(page.getByRole('dialog')).toBeVisible();
-  await page.getByRole('dialog').getByLabel('写稿目标IP',{exact:true}).selectOption(ips[0].id);
-  await page.getByRole('button',{name:'确认并加入写稿',exact:true}).click();
-  await expect.poll(()=>adopted?.ip_id).toBe(ips[0].id);
+  await expect(page.getByRole('button',{name:'加入写稿',exact:true})).toHaveCount(0);
+  await page.getByRole('button',{name:'调用写手',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'素材调用写手'});
+  await dialog.getByLabel('调用目标IP',{exact:true}).selectOption(ips[0].id);
+  await expect(dialog.getByLabel('对标逐字稿',{exact:true})).toHaveValue('这段话来自原视频的转写。');
+  await expect(dialog.getByRole('checkbox',{name:/已核对逐字稿/})).not.toBeChecked();
+  expect(transcriptRequests).toBe(1);
+});
+
+test('自动转写失败可重试，返回结果保留用户手工录入', async ({page, request}) => {
+  await request.post('/api/auth/login', {data:{username:'admin',password:'admin'}});
+  const team = await (await request.post('/api/teams', {data:{name:'转写重试验收'}})).json();
+  const ip = await (await request.post('/api/ips', {data:{name:'转写重试IP',team_id:team.id}})).json();
+  await page.route('**/api/records/materials', route => route.fulfill({json:[
+    {id:'video-retry',ip_id:ip.id,title:'转写重试素材',platform:'视频号',transcript_supported:true},
+  ]}));
+  let calls = 0;
+  await page.route('**/api/materials/video-retry/transcript', route => {
+    calls++;
+    return calls === 1
+      ? route.fulfill({status:422,json:{detail:'本次未能读取视频音轨'}})
+      : route.fulfill({json:{text:'后台辨识到的原始语音。',cached:false}});
+  });
+  await openTopicCollection(page);
+  await page.getByRole('button',{name:'调用写手',exact:true}).click();
+  const dialog = page.getByRole('dialog',{name:'素材调用写手'});
+  const reference = dialog.getByLabel('对标逐字稿',{exact:true});
+  await expect(dialog).toContainText('本次未能读取视频音轨');
+  await reference.fill('手工核对后的对标逐字稿。');
+  await dialog.getByRole('button',{name:'重试提取',exact:true}).click();
+  await expect(dialog.getByRole('button',{name:'填入自动转写结果',exact:true})).toBeVisible();
+  await expect(reference).toHaveValue('手工核对后的对标逐字稿。');
+  await dialog.getByRole('button',{name:'填入自动转写结果',exact:true}).click();
+  await expect(reference).toHaveValue('后台辨识到的原始语音。');
+  expect(calls).toBe(2);
 });
 
 async function openTopicCollection(page: Page) {
@@ -116,8 +149,6 @@ test('采集表单使用爆款系统的默认设置', async ({ page }) => {
     pages: 1,
     per_word_limit: 10,
     max_videos: 20,
-    min_likes: 0,
-    min_duration: 0,
     comment_pages: 1,
     enrich_authors: false,
     sort_type: '1',
@@ -125,6 +156,33 @@ test('采集表单使用爆款系统的默认设置', async ({ page }) => {
   });
   await expect(page.getByLabel('视频号', { exact: true })).not.toBeChecked();
   await expect(page.getByLabel('发布时间')).toHaveValue('platform_default');
+  await page.getByRole('button', { name: '采集范围 · 展开', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: /最低点赞|最低时长/ })).toHaveCount(0);
+  await expect(page.getByText('作品入库后，按系统设置中的作品推荐规则统一计算。')).toBeVisible();
+});
+
+test('可用素材按作品规则判断历史记录', async ({ page }) => {
+  await page.route('**/api/records/materials', route => route.fulfill({ json: [
+    { id: 'legacy-available', title: '历史入库的低赞作品', likes: 5, status: 'new', eligible: false,
+      discovery: { available: true, recommended: false } },
+    { id: 'unavailable', title: '来源不可用的作品', likes: 900, status: 'new', eligible: true,
+      discovery: { available: false, recommended: false } },
+    { id: 'recommended', title: '推荐参考的作品', likes: 1000, status: 'new',
+      discovery: { available: true, recommended: true, candidate: true } },
+  ] }));
+  await openTopicCollection(page);
+  await expect(page.getByText('历史入库的低赞作品', { exact: true })).toBeVisible();
+  await expect(page.getByText('来源不可用的作品', { exact: true })).toBeVisible();
+
+  await page.getByRole('button', { name: '可用素材', exact: true }).click();
+  await expect(page.getByText('历史入库的低赞作品', { exact: true })).toBeVisible();
+  await expect(page.getByText('推荐参考的作品', { exact: true })).toBeVisible();
+  await expect(page.getByText('来源不可用的作品', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('未达可用素材筛选条件', { exact: true })).toHaveCount(0);
+
+  await page.getByRole('button', { name: '推荐', exact: true }).click();
+  await expect(page.getByText('推荐参考的作品', { exact: true })).toBeVisible();
+  await expect(page.getByText('历史入库的低赞作品', { exact: true })).toHaveCount(0);
 });
 
 test('采集表单的数字可清空、逐字输入和粘贴', async ({ page, context }) => {
@@ -132,7 +190,7 @@ test('采集表单的数字可清空、逐字输入和粘贴', async ({ page, co
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await openTopicCollection(page);
   await page.getByLabel('搜索关键词').fill('保障范围');
-  await page.getByRole('button', { name: /采集范围与筛选/ }).click();
+  await page.getByRole('button', { name: '采集范围 · 展开', exact: true }).click();
 
   const perWord = page.getByLabel('每词每平台最多作品数');
   await perWord.fill('');
@@ -142,15 +200,15 @@ test('采集表单的数字可清空、逐字输入和粘贴', async ({ page, co
   await perWord.press('Tab');
   await expect(perWord).toHaveValue('15');
 
-  const minLikes = page.getByLabel('可用素材最低点赞');
-  await page.evaluate(() => navigator.clipboard.writeText('1200'));
-  await minLikes.selectText();
-  await minLikes.press('ControlOrMeta+V');
-  await expect(minLikes).toHaveValue('1200');
+  const pages = page.getByLabel('每词每平台搜索页数');
+  await page.evaluate(() => navigator.clipboard.writeText('3'));
+  await pages.selectText();
+  await pages.press('ControlOrMeta+V');
+  await expect(pages).toHaveValue('3');
 
   const request = page.waitForRequest('**/api/collection/search');
   await page.getByRole('button', { name: '搜索并自动入库' }).click();
-  expect((await request).postDataJSON()).toMatchObject({ per_word_limit: 15, min_likes: 1200 });
+  expect((await request).postDataJSON()).toMatchObject({ per_word_limit: 15, pages: 3 });
 });
 
 for (const { label, value } of [{ label: '空值', value: '' }, { label: '越界值', value: '21' }]) {
@@ -162,7 +220,7 @@ for (const { label, value } of [{ label: '空值', value: '' }, { label: '越界
     });
     await openTopicCollection(page);
     await page.getByLabel('搜索关键词').fill('保障范围');
-    const advanced = page.getByRole('button', { name: /采集范围与筛选/ });
+    const advanced = page.getByRole('button', { name: /^采集范围 · / });
     await advanced.click();
     const perWord = page.getByLabel('每词每平台最多作品数');
     await perWord.fill(value);
@@ -172,7 +230,7 @@ for (const { label, value } of [{ label: '空值', value: '' }, { label: '越界
     await page.getByRole('button', { name: '搜索并自动入库', exact: true }).click();
 
     await expect(advanced).toHaveAttribute('aria-expanded', 'true');
-    await expect(page.getByRole('alert')).toHaveText('请检查采集范围与筛选中的数字。');
+    await expect(page.getByRole('alert')).toHaveText('请检查采集范围中的数字。');
     await expect(perWord).toHaveAttribute('aria-invalid', 'true');
     await expect(perWord).toBeFocused();
     expect(submitted).toBe(false);

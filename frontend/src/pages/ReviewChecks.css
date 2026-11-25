@@ -1,0 +1,54 @@
+.review-check-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+.review-check-heading h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.review-check-heading strong {
+  font-size: 13px;
+}
+.review-pass-text { color: #267143; }
+.review-fail-text { color: #a32020; }
+.review-warning-text { color: #825a09; }
+.review-checks .check-result > span { flex: 0 0 15px; }
+.review-checks .check-result > strong { white-space: nowrap; }
+.review-checks .check-result > div { min-width: 0; }
+.review-checks .check-result small { color: #54647b; margin-top: 3px; }
+.review-checks .check-result.advisory > span { background: #fff4d6; color: #825a09; }
+.review-overlap {
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+  padding-top: 16px;
+}
+.review-overlap p {
+  font-size: 12px;
+  line-height: 1.7;
+  margin: 8px 0;
+}
+.review-snippets {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  max-height: 20rem;
+  overflow: auto;
+}
+.review-snippets li {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.review-snippets li > p { margin: 0 0 4px; }
+.review-snippets li span { color: #54647b; margin-right: 8px; }
+.review-snippets mark {
+  background: #fdf1ee;
+  color: #a32020;
+  border-radius: 3px;
+  padding: 2px 4px;
+  overflow-wrap: anywhere;
+}

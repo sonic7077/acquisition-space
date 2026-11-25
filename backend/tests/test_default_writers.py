@@ -55,7 +55,10 @@ def test_material_call_defaults_transcript_permissions_and_rewrite(env):
     viral=next(x for x in rows if x['skill']=='viral-rewrite-writer')
     p={**payload,'writer_id':viral['id']}
     assert c.post(url+'/context',json=p).status_code==422
-    assert c.post(url+'/context',json={**p,'reference':'真实口播全文','transcript_confirmed':True}).status_code==200
+    preview = c.post(url+'/context',json={**p,'reference':'真实口播全文','transcript_confirmed':True})
+    assert preview.status_code == 200
+    assert preview.json()['transcript_confirmed'] is True
+    assert '连续8字' in preview.json()['prompt']
     unrelated=c.post('/api/records/leads',json={'ip_id':ip['id'],'title':'其他','body':'多少钱','material_id':'else'}).json()
     assert c.post(url+'/context',json={**payload,'comment_ids':[unrelated['id']]}).status_code==422
     other=c.post('/api/teams',json={'name':'无权限团队'}).json();outside=c.post('/api/ips',json={'name':'外部IP','team_id':other['id']}).json()
@@ -124,6 +127,8 @@ def test_auxiliary_and_content_jobs_preserve_sources_and_knowledge_invalidation(
         j=next(x for x in c.get('/api/jobs').json() if x['id']==r.json()['id']);assert j['status']=='completed',j
         out=next(x for x in c.get('/api/drafts' if w['kind']=='content' else '/api/writing/analyses').json() if x['id']==j.get('draft_id',j.get('analysis_id')))
         assert out['material_id']==m['id'] and out['writer_snapshot']['id']==w['id'] and out['knowledge_snapshot']['count']==1
+        if w['kind']=='content':
+            assert out['reference']==p['reference'] and out['transcript_confirmed'] is True
     assert len(c.get('/api/drafts').json())==5 and len(c.get('/api/writing/analyses').json())==3
     w=next(x for x in rows if x['kind']=='content')
     j=c.post(url,json={**p,'writer_id':w['id'],'request_id':'stale-doc'}).json()
