@@ -4,7 +4,7 @@ import pytest
 from backend.tests.test_collection import setup, FeishuMock, add_sync_data
 from backend.app.db import Record
 
-WIKI = 'https://wcn8zd3z0yjw.feishu.cn/wiki/Me3owpcvFirsbEkqMc9cZ7PLnAf'
+WIKI = 'https://example-tenant.feishu.cn/wiki/ExampleWikiToken12345'
 
 
 class WikiMock(FeishuMock):
@@ -19,7 +19,7 @@ class WikiMock(FeishuMock):
         self.paths.append((req.method, req.url.path))
         if '/wiki/v2/' in req.url.path:
             if req.url.path.endswith('/get_node'):
-                data = {'node': {'space_id': 'space1', 'node_token': 'Me3owpcvFirsbEkqMc9cZ7PLnAf', 'obj_type': self.object_type, 'obj_token': 'newbase' if self.object_type=='bitable' else 'templatedoc', 'title': '爆款空间'}}
+                data = {'node': {'space_id': 'space1', 'node_token': 'ExampleWikiToken12345', 'obj_type': self.object_type, 'obj_token': 'newbase' if self.object_type=='bitable' else 'templatedoc', 'title': '爆款空间'}}
             elif req.method == 'POST':
                 self.created.append(json.loads(req.content))
                 data = {'node': {'obj_type': 'docx', 'obj_token': 'exportdoc'+str(len(self.created)), 'node_token': 'exportnode'+str(len(self.created))}}
@@ -52,7 +52,7 @@ def test_wiki_bitable_resolution_and_three_table_sync(setup):
     run_sync_job(app,job['id'])
     assert len(mock.rows['tbl-works'])==1
     assert any('/apps/newbase/tables' in path for _,path in mock.paths)
-    assert all('/apps/FPfJ' not in path for _,path in mock.paths)
+    assert all('/apps/ExampleBase' not in path for _,path in mock.paths)
 
 
 def test_docx_target_rejected_without_writes(setup):
@@ -93,7 +93,7 @@ def test_cli_config_and_schema_admin_only(setup):
 def test_running_sync_stops_on_destination_change(setup):
     from backend.app.integrations.feishu import run_sync_job
     app,c,ip,_=setup
-    c.put('/api/settings',json={'feishu':{'app_id':'fake','app_secret':'fake','enabled':True}})
+    c.put('/api/settings',json={'feishu':{'url':'https://example-tenant.feishu.cn/base/InitialBaseToken001','app_id':'fake','app_secret':'fake','enabled':True}})
     add_sync_data(app,ip['id']);mock=WikiMock()
     def transport(req):
         result=mock(req)
@@ -140,9 +140,26 @@ def test_destination_change_clears_previous_table_bindings(setup):
     assert not result.get('authors_table_id') and not result.get('field_mapping')
 
 
-def test_new_install_defaults_to_latest_user_template(tmp_path):
+def test_new_install_defaults_and_env_override(tmp_path, monkeypatch):
     from backend.app.main import create_app
+    from backend.app.env import load_env_file
     from fastapi.testclient import TestClient
-    c=TestClient(create_app(tmp_path))
-    c.post('/api/auth/login',json={'username':'admin','password':'admin'})
-    assert c.get('/api/settings').json()['feishu']['url']==WIKI
+
+    c = TestClient(create_app(tmp_path / 'fresh'))
+    c.post('/api/auth/login', json={'username': 'admin', 'password': 'admin'})
+    assert c.get('/api/settings').json()['feishu']['url'] == ''
+    assert c.put('/api/settings', json={'feishu': {'enabled': True}}).status_code == 422
+
+    monkeypatch.setenv('FEISHU_DEFAULT_URL', WIKI)
+    monkeypatch.setenv('FEISHU_ALLOWED_HOSTS', 'example-tenant.feishu.cn')
+    c2 = TestClient(create_app(tmp_path / 'env_default'))
+    c2.post('/api/auth/login', json={'username': 'admin', 'password': 'admin'})
+    assert c2.get('/api/settings').json()['feishu']['url'] == WIKI
+    assert c2.put('/api/settings', json={'feishu': {'url': 'https://other.feishu.cn/wiki/Abc123'}}).status_code == 422
+
+    env_path = tmp_path / '.env'
+    env_path.write_text("# comment\nTEST_LOAD_ENV='loaded_val'\n", encoding='utf-8')
+    monkeypatch.delenv('TEST_LOAD_ENV', raising=False)
+    load_env_file(env_path)
+    import os
+    assert os.environ.get('TEST_LOAD_ENV') == 'loaded_val'

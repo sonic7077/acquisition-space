@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 from zoneinfo import ZoneInfo
-from sqlalchemy import create_engine, event, String, Text, JSON, Integer, Boolean
+from sqlalchemy import create_engine, event, String, Text, JSON, Integer, Boolean, Float, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -54,6 +54,197 @@ class Record(Base):
     updated_at: Mapped[str] = mapped_column(String, default=now)
 
 
+class ExecutorNode(Base):
+    __tablename__ = 'executor_nodes'
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    name: Mapped[str] = mapped_column(String)
+    node_scope: Mapped[str] = mapped_column(String, index=True)  # server_direct | server_relay | client_local
+    owner_user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    transport_mode: Mapped[str] = mapped_column(String)  # direct_http | agent_relay
+    mcp_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    secret_hash: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String, default='offline')  # online | offline | mcp_error | revoked
+    revoked_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    vcat_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_heartbeat_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    capabilities_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+    updated_at: Mapped[str] = mapped_column(String, default=now, onupdate=now)
+
+
+class AgentPairCode(Base):
+    __tablename__ = 'agent_pair_codes'
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    code_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    node_scope: Mapped[str] = mapped_column(String)  # server_relay | client_local
+    owner_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    label: Mapped[str] = mapped_column(String, default='')
+    expires_at: Mapped[str] = mapped_column(String)
+    used_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+
+
+class PlatformAccount(Base):
+    __tablename__ = 'platform_accounts'
+    __table_args__ = (UniqueConstraint('node_id', 'vendor_uid', name='uq_platform_account_node_vendor'),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    node_id: Mapped[str] = mapped_column(String, index=True)
+    vendor_uid: Mapped[str] = mapped_column(String, index=True)
+    platform: Mapped[str] = mapped_column(String, index=True)
+    platform_name: Mapped[str] = mapped_column(String, default='')
+    nickname: Mapped[str] = mapped_column(String, default='')
+    avatar: Mapped[str | None] = mapped_column(Text, nullable=True)
+    team_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    ip_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    login_status: Mapped[str] = mapped_column(String, default='未知')
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_verified_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    verify_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    bound_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    removed_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+    updated_at: Mapped[str] = mapped_column(String, default=now, onupdate=now)
+
+
+class PublishTarget(Base):
+    __tablename__ = 'publish_targets'
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    schedule_id: Mapped[str] = mapped_column(String, index=True)
+    ip_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    draft_id: Mapped[str] = mapped_column(String, index=True)
+    draft_version: Mapped[int] = mapped_column(Integer)
+    account_id: Mapped[str] = mapped_column(String, index=True)
+    platform: Mapped[str] = mapped_column(String)
+    content_type: Mapped[str] = mapped_column(String, default='video')  # video | pics | wechat_draft
+    schedule_owner: Mapped[str] = mapped_column(String, default='server')  # server | platform
+    approved_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    snapshot_hash: Mapped[str] = mapped_column(String)
+    planned_at_utc: Mapped[str] = mapped_column(String, index=True)
+    execution_mode: Mapped[str] = mapped_column(String, default='publish')  # draft | publish | manual
+    status: Mapped[str] = mapped_column(String, default='QUEUED', index=True)
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+    updated_at: Mapped[str] = mapped_column(String, default=now, onupdate=now)
+
+
+class PublishAttempt(Base):
+    __tablename__ = 'publish_attempts'
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    target_id: Mapped[str] = mapped_column(String, index=True)
+    attempt_no: Mapped[int] = mapped_column(Integer, default=1)
+    idempotency_key: Mapped[str] = mapped_column(String, unique=True, index=True)
+    state: Mapped[str] = mapped_column(String, default='QUEUED', index=True)
+    node_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    lease_until: Mapped[str | None] = mapped_column(String, nullable=True)
+    submit_started_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    vendor_local_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    vendor_draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    platform_post_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    evidence_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_class: Mapped[str | None] = mapped_column(String, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+    updated_at: Mapped[str] = mapped_column(String, default=now, onupdate=now)
+
+
+class AgentCommand(Base):
+    __tablename__ = 'agent_commands'
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    action_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    node_id: Mapped[str] = mapped_column(String, index=True)
+    tool_name: Mapped[str] = mapped_column(String)
+    arguments_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    media_refs_json: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String, default='queued', index=True)
+    lease_until: Mapped[str | None] = mapped_column(String, nullable=True)
+    result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+    updated_at: Mapped[str] = mapped_column(String, default=now, onupdate=now)
+    finished_at: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class AuthChallenge(Base):
+    __tablename__ = 'auth_challenges'
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    node_id: Mapped[str] = mapped_column(String, index=True)
+    account_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    target_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    platform: Mapped[str] = mapped_column(String)
+    challenge_type: Mapped[str] = mapped_column(String)  # new_account_iframe | channels_face_verify
+    status: Mapped[str] = mapped_column(String, default='WAITING_SCAN', index=True)
+    vendor_link_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    encrypted_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[str] = mapped_column(String)
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    completed_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+    updated_at: Mapped[str] = mapped_column(String, default=now, onupdate=now)
+
+
+class PublishedPost(Base):
+    __tablename__ = 'published_posts'
+    __table_args__ = (UniqueConstraint('platform', 'vendor_uid', 'vendor_post_id', name='uq_post_platform_uid_pid'),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    platform: Mapped[str] = mapped_column(String, index=True)
+    account_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    ip_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    vendor_uid: Mapped[str] = mapped_column(String, index=True)
+    vendor_post_id: Mapped[str] = mapped_column(String, index=True)
+    draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    target_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    title: Mapped[str] = mapped_column(String, default='')
+    desc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cover_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    visibility: Mapped[str | None] = mapped_column(String, nullable=True)
+    publish_status: Mapped[str] = mapped_column(String, default='published')
+    post_time_utc: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_synced_at: Mapped[str] = mapped_column(String, default=now)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+    updated_at: Mapped[str] = mapped_column(String, default=now, onupdate=now)
+
+
+class MetricSnapshot(Base):
+    __tablename__ = 'metric_snapshots'
+    __table_args__ = (UniqueConstraint('subject_type', 'subject_id', 'observed_date', 'metric_type', name='uq_metric_subject_date_type'),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    subject_type: Mapped[str] = mapped_column(String, index=True)  # account | post
+    subject_id: Mapped[str] = mapped_column(String, index=True)
+    ip_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    observed_date: Mapped[str] = mapped_column(String, index=True)
+    metric_type: Mapped[str] = mapped_column(String, default='cumulative')
+    views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    likes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    comments: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    forwards: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    favorites: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fans_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fans_add: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    full_view_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_view_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[str] = mapped_column(String, default=now, onupdate=now)
+
+
+class VcatActionLog(Base):
+    __tablename__ = 'vcat_action_logs'
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    actor_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    node_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    account_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    action_type: Mapped[str] = mapped_column(String)
+    tool_name: Mapped[str] = mapped_column(String)
+    request_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    result_status: Mapped[str] = mapped_column(String)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+
+
 def database(path):
     engine = create_engine(f'sqlite:///{path}', connect_args={'check_same_thread': False, 'timeout': 30})
     @event.listens_for(engine, 'connect')
@@ -62,6 +253,15 @@ def database(path):
         dbapi.execute('PRAGMA foreign_keys=ON')
         dbapi.execute('PRAGMA busy_timeout=30000')
     Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        for table, column, col_type in (
+            ('executor_nodes', 'revoked_at', 'TEXT'),
+            ('platform_accounts', 'removed_at', 'TEXT'),
+            ('auth_challenges', 'vendor_link_id', 'TEXT'),
+        ):
+            cols = {row[1] for row in conn.exec_driver_sql(f'PRAGMA table_info({table})').fetchall()}
+            if column not in cols:
+                conn.exec_driver_sql(f'ALTER TABLE {table} ADD COLUMN {column} {col_type}')
     return engine, sessionmaker(engine, expire_on_commit=False)
 
 

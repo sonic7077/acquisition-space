@@ -23,9 +23,8 @@ from .discovery import DEFAULT_RULES, rules_for, validate_rules, author_patch, d
 from .validation import record_input, text_fields
 from .knowledge_categories import TREE, flatten, leaf, migrate as migrate_knowledge
 
-from .integrations.feishu_target import WIKI_URL
+from .integrations.feishu_target import default_url as default_feishu_url
 
-FEISHU_URL = WIKI_URL
 KINDS = {'materials', 'authors', 'needs', 'leads', 'metrics', 'rules'}
 
 
@@ -152,10 +151,19 @@ def create_app(data_dir=None):
         for scheduled in db.scalars(select(Record).where(Record.kind == 'schedules')):
             if scheduled.payload.get('draft_id') in draft_ids and scheduled.payload.get('status') in ('planned', 'staged'):
                 scheduled.payload = {**scheduled.payload, 'status': 'needs_review'}
+        from .db import PublishTarget, PublishAttempt
+        for target in db.scalars(select(PublishTarget).where(PublishTarget.draft_id.in_(list(draft_ids)))):
+            if target.status in ('QUEUED', 'WAITING_CLIENT_ONLINE'):
+                target.status = 'NEEDS_REVIEW'
+                for att in db.scalars(select(PublishAttempt).where(PublishAttempt.target_id == target.id)):
+                    if att.state in ('QUEUED', 'WAITING_CLIENT_ONLINE'):
+                        att.state = 'CANCELLED'
+                        att.error_class = 'DRAFT_INVALID'
+                        att.error_message = '稿件版本或批准已变化，排期已暂停'
 
     def setting_data(db):
         row = db.get(Record, 'system-settings')
-        return row.payload if row else {'model': {}, 'feishu': {'url': FEISHU_URL}, 'collection': {}, 'transcription': {}, 'wechat': {}, 'executor': {}, 'rules': {'overlap_min': 8, 'overlap_max': .08}}
+        return row.payload if row else {'model': {}, 'feishu': {'url': default_feishu_url()}, 'collection': {}, 'transcription': {}, 'wechat': {}, 'executor': {}, 'rules': {'overlap_min': 8, 'overlap_max': .08}}
 
     def mask_settings(data):
         return {section: {**{k: v for k, v in fields.items() if not k.endswith('_encrypted')}, **{k.removesuffix('_encrypted') + '_configured': bool(v) for k, v in fields.items() if k.endswith('_encrypted')}} for section, fields in data.items()}
@@ -317,7 +325,7 @@ def create_app(data_dir=None):
             'collection': {'base_url', 'api_key', 'daily_budget', 'enabled'},
             'transcription': {'base_url', 'model', 'api_key'},
             'wechat': {'app_id', 'app_secret', 'webhook'},
-            'executor': {'base_url', 'token'},
+            'executor': {'mode', 'base_url', 'token', 'catchup_minutes', 'preflight_minutes', 'allow_client_local', 'allow_interaction_write'},
             'rules': {'overlap_min', 'overlap_max'},
             'discovery': set(DEFAULT_RULES) - {'version'},
         }
@@ -334,11 +342,15 @@ def create_app(data_dir=None):
                     raise HTTPException(422, '未知设置字段')
                 if section == 'feishu' and key == 'auth_mode' and val not in ('app', 'cli'):
                     raise HTTPException(422, '飞书认证方式为app或cli')
-                if key == 'enabled' and not isinstance(val, bool):
+                if section == 'executor' and key == 'mode' and val not in ('manual', 'server_direct', 'server_relay', 'client_local', 'hybrid'):
+                    raise HTTPException(422, '执行器模式无效')
+                if key in ('enabled', 'allow_client_local', 'allow_interaction_write') and not isinstance(val, bool):
                     raise HTTPException(422, '启用开关必须是布尔值')
                 if key == 'daily_budget' and (not isinstance(val, (int, float)) or isinstance(val, bool) or not 1 <= val <= 100000):
                     raise HTTPException(422, '每日调用预算须为1至100000')
-                if key not in ('enabled', 'daily_budget', 'overlap_min', 'overlap_max') and val is not None and (not isinstance(val, str) or len(val) > 10000):
+                if key in ('catchup_minutes', 'preflight_minutes') and (not isinstance(val, int) or isinstance(val, bool) or not 1 <= val <= 1440):
+                    raise HTTPException(422, '时间窗口须为1至1440分钟')
+                if key not in ('enabled', 'allow_client_local', 'allow_interaction_write', 'daily_budget', 'overlap_min', 'overlap_max', 'catchup_minutes', 'preflight_minutes') and val is not None and (not isinstance(val, str) or len(val) > 10000):
                     raise HTTPException(422, '配置字段必须为文本且不超过10000字符')
                 if key in ('api_key', 'app_secret', 'token', 'webhook'):
                     if val is None:
@@ -354,10 +366,15 @@ def create_app(data_dir=None):
             value[section] = merged
         from .integrations.feishu_target import parse_url
         from .integrations.common import IntegrationError
-        try:
-            parse_url(value.get('feishu', {}).get('url'))
-        except (IntegrationError, ValueError) as exc:
-            raise HTTPException(422, '请使用用户飞书空间内有效的HTTPS base、wiki或docx链接') from None
+        feishu_cfg = value.get('feishu', {})
+        feishu_url = (feishu_cfg.get('url') or '').strip()
+        if feishu_url:
+            try:
+                parse_url(feishu_url)
+            except (IntegrationError, ValueError):
+                raise HTTPException(422, '请使用有效的飞书 HTTPS base、wiki 或 docx 链接') from None
+        elif feishu_cfg.get('enabled') and not default_feishu_url():
+            raise HTTPException(422, '启用飞书同步前请配置有效的飞书链接')
         rule = value.get('rules', {})
         try:
             if not 2 <= int(rule.get('overlap_min', 8)) <= 100 or not 0 <= float(rule.get('overlap_max', .08)) <= 1:
@@ -834,7 +851,7 @@ def create_app(data_dir=None):
         media = [a for a in visible(db, user, 'assets') if a.payload.get('draft_id') == draft.id and a.payload['draft_version'] == p['version'] and a.payload['type'] == 'video']
         if not media:
             raise HTTPException(409, '当前批准版本尚无视频资产')
-        if not data.get('account') or data.get('platform') not in ('抖音', '视频号', '小红书'):
+        if not data.get('account') or data.get('platform') not in ('抖音', '视频号', '小红书', '哔哩哔哩', '公众号'):
             raise HTTPException(422, '请选择平台并填写明确账号')
         try:
             planned = datetime.fromisoformat(data['planned_at'])
@@ -892,7 +909,7 @@ def create_app(data_dir=None):
         raw = file.file.read(MAX_FILE + 1)
         if len(raw) > MAX_FILE:
             raise HTTPException(422, '报表上限20MB')
-        if platform not in ('抖音', '视频号', '小红书'):
+        if platform not in ('抖音', '视频号', '小红书', '哔哩哔哩', '公众号'):
             raise HTTPException(422, '不支持的平台')
         try:
             if (file.filename or '').lower().endswith('.xlsx'):
@@ -988,6 +1005,10 @@ def create_app(data_dir=None):
     register_transcript(app, audit, authenticated_user)
     from .rewrite import register as register_rewrite
     register_rewrite(app, get_db, current, audit)
+    from .operations.routes import register_operations
+    register_operations(app, authenticated_user)
+    from .operations.agent_routes import register_agent_routes
+    register_agent_routes(app)
 
     dist = Path(__file__).resolve().parents[2] / 'frontend' / 'dist'
     if dist.exists():

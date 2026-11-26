@@ -33,6 +33,29 @@ export const STATE: Row = {
   dependency: "待依赖",
   manual: "待人工发表",
   skipped: "已跳过",
+  QUEUED: "排队中",
+  PREFLIGHT: "预检中",
+  STAGING: "媒体同步中",
+  SUBMITTING: "提交中",
+  ACCEPTED: "平台已受理",
+  PLATFORM_SCHEDULED: "平台定时中",
+  REVIEWING: "审核中",
+  DRAFT_PUSHED: "已推草稿箱",
+  PUBLISHED: "已发表",
+  REJECTED: "平台拒绝",
+  UNKNOWN: "结果未知",
+  RETRYABLE_FAILED: "失败可重试",
+  MISSED: "错过排期",
+  CANCELLED: "已取消",
+  WAITING_AUTH: "等待扫码验证",
+  WAITING_CLIENT_ONLINE: "等待本机上线",
+  WAITING_SCAN: "待扫码",
+  VERIFIED: "已验证",
+  EXPIRED: "已过期",
+  online: "在线",
+  offline: "离线",
+  mcp_error: "MCP异常",
+  revoked: "已吊销",
 };
 
 export function Badge({ value }: { value: string }) {
@@ -47,9 +70,28 @@ export function Badge({ value }: { value: string }) {
           "adopted",
           "completed",
           "confirmed",
+          "PUBLISHED",
+          "VERIFIED",
+          "online",
+          "登录有效",
         ].includes(value)
           ? "good"
-          : ["failed", "needs_review", "unknown", "returned"].includes(value)
+          : [
+              "failed",
+              "needs_review",
+              "unknown",
+              "returned",
+              "UNKNOWN",
+              "REJECTED",
+              "MISSED",
+              "EXPIRED",
+              "mcp_error",
+              "offline",
+              "revoked",
+              "已从小V猫移除",
+              "已在小V猫移除",
+              "登录失效",
+            ].includes(value)
             ? "bad"
             : "")
       }

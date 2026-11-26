@@ -1885,3 +1885,11 @@ footer {
 .comment-distribution { padding:8px 14px; margin-bottom:12px; border-radius:8px; background:#f4f6f8; font-size:13px; }
 .discovery-rules td { white-space:normal; min-width:100px; }
 @media(max-width:800px) { .help-stages { grid-template-columns:1fr; } }
+
+/* Operations module (Xiaovmao dual-mode) */
+.ops-inline-form { display:flex; gap:12px; flex-wrap:wrap; align-items:end; margin-bottom:14px; }
+.ops-inline-form .field { margin:0; min-width:180px; }
+.ops-iframe-box { display:grid; gap:12px; margin-top:12px; }
+.ops-auth-iframe { width:100%; height:480px; border:1px solid var(--border); border-radius:10px; background:#fff; }
+.ops-qr-wrap { display:grid; justify-items:center; gap:12px; padding:12px 0; text-align:center; }
+.ops-qr-img { width:240px; height:240px; image-rendering:pixelated; background:#fff; padding:8px; border:1px solid var(--border); border-radius:10px; }

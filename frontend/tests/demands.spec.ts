@@ -30,6 +30,7 @@ test('评论双标签整理需求，原话、透明评分与写手上下文关�
   const drafts=await(await request.get('/api/drafts')).json();const draft=drafts.find((d:any)=>d.ip_id===ip.id&&d.need_id);expect(draft.demand_snapshot.quotes[0].body).toBe(lead.body);
   await page.getByRole('button',{name:'审稿',exact:true}).click();await page.locator('.draft-item').filter({hasText:draft.id.slice(0,8)}).click();
   await page.getByRole('button',{name:'用写手改编',exact:true}).click();const rewrite=page.getByRole('dialog',{name:'用写手改编'});
+  await rewrite.getByLabel('专属写手',{exact:true}).selectOption(writer.id);
   await rewrite.getByLabel('改编文体',{exact:true}).selectOption('original-video-writer');
   await expect(rewrite.getByLabel('关联需求',{exact:true})).toHaveValue(draft.need_id);
   await rewrite.getByRole('button',{name:'预览改编上下文',exact:true}).click();

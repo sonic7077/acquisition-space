@@ -51,9 +51,13 @@ def start(root, python, port=8787):
 
 
 if __name__=='__main__':
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
+    from backend.app.env import load_env_file
+    load_env_file(root / '.env')
     port=int(os.environ.get('ACQUISITION_PORT','8787'))
     try:
-        pid=start(Path(__file__).resolve().parent.parent,sys.executable,port)
+        pid=start(root,sys.executable,port)
         print(f'获客空间已启动：http://127.0.0.1:{port}（进程 {pid or "已运行"}）\n关闭此窗口不会停止服务。日志：.data/server.log')
     except RuntimeError as error:
         print(str(error),file=sys.stderr)

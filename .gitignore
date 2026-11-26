@@ -12,3 +12,6 @@ playwright-report/
 *.tsbuildinfo
 backups/
 /docs/知识库同步/
+.codex/
+executor/*.env
+

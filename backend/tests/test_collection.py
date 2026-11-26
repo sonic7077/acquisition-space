@@ -13,8 +13,8 @@ def setup(tmp_path):
     client.post('/api/auth/login', json={'username': 'admin', 'password': 'admin'})
     team = client.post('/api/teams', json={'name': '采集组'}).json()
     ip = client.post('/api/ips', json={'name': '顾问IP', 'team_id': team['id']}).json()
-    # Legacy direct-base fixture remains explicit; production defaults use the latest Wiki.
-    client.put('/api/settings',json={'feishu':{'url':'https://wcn8zd3z0yjw.feishu.cn/base/FPfJblv7WaQ3YTs3OhCcj2uAnHb'}})
+    # Legacy direct-base fixture remains explicit; production defaults leave URL unconfigured until set.
+    client.put('/api/settings',json={'feishu':{'url':'https://example-tenant.feishu.cn/base/ExampleBaseToken001'}})
     client.put('/api/settings', json={'collection': {'api_key': 'test-tikhub-private', 'enabled': True, 'daily_budget': 50}})
     return app, client, ip, team
 

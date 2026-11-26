@@ -215,7 +215,7 @@ def test_unassigned_feishu_sync_only_uses_submitter_pool(env):
     from backend.tests.test_collection import FeishuMock
     from backend.app.integrations.feishu import run_sync_job
     app,c,team,ip=env
-    c.put('/api/settings',json={'feishu':{'enabled':True,'app_id':'fake','app_secret':'fake'}})
+    c.put('/api/settings',json={'feishu':{'enabled':True,'app_id':'fake','app_secret':'fake','url':'https://example-tenant.feishu.cn/base/ExampleBaseToken001'}})
     c.post('/api/users',json={'username':'other','name':'其他成员','password':'Member-123456!','team_id':team['id'],'role':'member','ip_ids':[]})
     other=TestClient(app);other.post('/api/auth/login',json={'username':'other','password':'Member-123456!'})
     c.post('/api/records/materials',json={'title':'本人素材'})

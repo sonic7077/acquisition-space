@@ -1,0 +1,2 @@
+# 独立运行 executor/vcat_agent.py 所需的最小第三方依赖清单（请通过 pip install -r executor/requirements.txt 安装）
+httpx>=0.28,<1
