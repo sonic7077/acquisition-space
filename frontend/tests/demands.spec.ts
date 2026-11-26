@@ -46,6 +46,7 @@ test('客户线索是需求的唯一入口，转选题和写手直接引用线�
 
   await page.getByRole('button', {name: '用写手改编', exact: true}).click();
   const rewrite = page.getByRole('dialog', {name: '用写手改编'});
+  await rewrite.getByLabel('专属写手', {exact: true}).selectOption(writer.id);
   await expect(rewrite.getByLabel('改编文体', {exact: true})).toHaveValue('original-video-writer');
   await expect(rewrite.getByLabel('关联需求', {exact: true})).toHaveValue(lead.id);
   await rewrite.getByRole('button', {name: '预览改编上下文', exact: true}).click();

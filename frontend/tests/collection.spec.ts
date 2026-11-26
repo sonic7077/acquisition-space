@@ -55,7 +55,7 @@ test('飞书三表字段预览与准备入口只展示映射结果',async({page}
   await page.goto('/');await page.getByRole('button',{name:'进入工作台'}).click();
   await page.getByRole('button',{name:'系统设置',exact:true}).click();
   await page.getByRole('button',{name:'飞书',exact:true}).click();
-  await expect(page.getByLabel('多维表格 / 知识空间链接')).toHaveValue(/Me3owpcvFirsbEkqMc9cZ7PLnAf/);
+  await expect(page.getByLabel('多维表格 / 知识空间链接')).toHaveValue('');
   await page.getByRole('button',{name:'读取三表与字段'}).click();
   await expect(page.getByText('请完成目标表与字段配置',{exact:true})).toBeVisible();
   await page.getByRole('button',{name:'检查并准备同步字段'}).click();

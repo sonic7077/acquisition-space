@@ -59,10 +59,13 @@ const CONFIG: Record<
   },
   executor: {
     name: "发布执行器",
-    desc: "登记独立执行端；当前尚未实现Windows RPA联调。",
+    desc: "统一配置小V猫双模式运行（服务器联通模式 / Web前端+本机小V猫模式）及节点配对。",
     fields: [
-      ["base_url", "执行器地址"],
-      ["token", "设备令牌", "password"],
+      ["mode", "执行模式", "executor_mode"],
+      ["base_url", "小V猫 MCP 地址（同机直连用）"],
+      ["token", "小V猫 MCP 令牌（加密保存）", "password"],
+      ["catchup_minutes", "超时追发窗口（分钟）", "number"],
+      ["preflight_minutes", "到期预检提前量（分钟）", "number"],
     ],
   },
   discovery: {
@@ -101,11 +104,15 @@ export default function SettingsPage(c: Ctx) {
     [busy, setBusy] = useState(false),
     [schema,setSchema] = useState<Row|null>(null),
     [syncPreview,setSyncPreview] = useState<Row|null>(null),
-    [librarySchema,setLibrarySchema] = useState<Row|null>(null);
+    [librarySchema,setLibrarySchema] = useState<Row|null>(null),
+    [nodesInfo,setNodesInfo] = useState<Row|null>(null),
+    [pairCmd,setPairCmd] = useState<Row|null>(null);
+  const loadNodes = () => api("/ops/nodes").then(setNodesInfo).catch(() => {});
   useEffect(() => {
     api("/settings")
       .then(setSettings)
       .catch((e) => c.notify(getError(e)));
+    loadNodes();
   }, [c.version]);
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -120,6 +127,10 @@ export default function SettingsPage(c: Ctx) {
       } else data[key] = type === "number" ? Number(v) : v;
     });
     if (["model","collection","feishu"].includes(tab)) data.enabled = f.get("enabled") === "on";
+    if (tab === "executor") {
+      data.allow_client_local = f.get("allow_client_local") === "on";
+      data.allow_interaction_write = f.get("allow_interaction_write") === "on";
+    }
     const result = await c.run(async () => {
       const s = await api("/settings", {
         method: "PUT",
@@ -169,13 +180,13 @@ export default function SettingsPage(c: Ctx) {
                       : "")
                   }
                 >
-                  {type === "auth_mode" ? <select name={key} defaultValue={settings[tab]?.auth_mode||'app'}><option value="app">应用 App ID / App Secret</option><option value="cli">本机已授权飞书 CLI（无需复制密钥）</option></select> : type === "textarea" ? <textarea name={key} rows={5} defaultValue={settings[tab]?.[key] || ''} placeholder={'{"works":{"likes":"点赞数","author_id":"博主关联"}}'} /> : <input
+                  {type === "auth_mode" ? <select name={key} defaultValue={settings[tab]?.auth_mode||'app'}><option value="app">应用 App ID / App Secret</option><option value="cli">本机已授权飞书 CLI（无需复制密钥）</option></select> : type === "executor_mode" ? <select name={key} defaultValue={settings[tab]?.mode||'manual'}><option value="manual">仅手工登记（不调外部执行器）</option><option value="server_direct">服务器联通 · 同机直连小V猫 (server_direct)</option><option value="server_relay">服务器联通 · 托管桌面执行机 (server_relay)</option><option value="client_local">Web前端 + 本机小V猫模式 (client_local)</option><option value="hybrid">混合模式（按账号绑定节点自动路由）</option></select> : type === "textarea" ? <textarea name={key} rows={5} defaultValue={settings[tab]?.[key] || ''} placeholder={'{"works":{"likes":"点赞数","author_id":"博主关联"}}'} /> : <input
                     name={key}
                     type={type || "text"}
                     step={tab === "discovery" ? "any" : key === "overlap_max" ? "0.01" : undefined}
                     autoComplete={type === "password" ? "new-password" : "off"}
                     defaultValue={
-                      type === "password" ? "" : (settings[tab]?.[key] ?? (key === "base_url" && tab === "collection" ? "https://api.tikhub.io" : key === "daily_budget" ? 100 : ""))
+                      type === "password" ? "" : (settings[tab]?.[key] ?? (key === "base_url" && tab === "collection" ? "https://api.tikhub.io" : key === "base_url" && tab === "executor" ? "http://127.0.0.1:3199/mcp" : key === "daily_budget" ? 100 : key === "catchup_minutes" || key === "preflight_minutes" ? 30 : ""))
                     }
                     readOnly={(tab === "collection" && key === "base_url")}
                     placeholder={
@@ -197,6 +208,10 @@ export default function SettingsPage(c: Ctx) {
                 </label>
               )}
               {['collection','feishu'].includes(tab) && <label className="check-row"><input name="enabled" type="checkbox" defaultChecked={settings[tab]?.enabled}/>{tab==='collection'?'启用TikHub采集':'启用飞书同步（采集完成后自动同步三表）'}</label>}
+              {tab === 'executor' && <>
+                <label className="check-row"><input name="allow_client_local" type="checkbox" defaultChecked={settings.executor?.allow_client_local ?? true}/>允许操作者在个人电脑运行本机小V猫代理 (client_local)</label>
+                <label className="check-row"><input name="allow_interaction_write" type="checkbox" defaultChecked={Boolean(settings.executor?.allow_interaction_write)}/>允许在运营页外发评论回复与私信（默认关闭，仅受控人工确认触发）</label>
+              </>}
               <div className="button-row">
                 <button className="primary" disabled={busy}>
                   保存设置
@@ -237,6 +252,15 @@ export default function SettingsPage(c: Ctx) {
           )}
           {tab === "discovery" && <p className="muted">当前配置版本 v{settings?.discovery?.version||1}。样本不足或缺失数据时不计算对应指标；本人/停用账号不进入对标推荐。所有成员可在素材和使用说明中查看规则，只有管理员可修改。</p>}
           {tab === 'collection' && <div className="schema-preview"><a href="https://docs.tikhub.io/doc-4579297" target="_blank" rel="noreferrer">查看 TikHub 官方说明 ↗</a><p className="muted">当前接入抖音、小红书与视频号。搜索任务自动读取范围内作品评论；不会因错误自动反复请求。每日调用预算是本系统的请求上限，实际计费以服务商账单为准。</p></div>}
+          {tab === 'executor' && <div className="schema-preview">
+            <div className="button-row">
+              <button type="button" onClick={() => c.run(async () => setPairCmd(await post('/ops/nodes/pair-code', { node_scope: 'server_relay', label: '服务器托管桌面执行机' })), '已生成服务器执行机配对命令')}>生成服务器执行机配对命令</button>
+              <button type="button" onClick={() => c.run(async () => setPairCmd(await post('/ops/nodes/pair-code', { node_scope: 'client_local', label: '操作者本机小V猫' })), '已生成前端本机代理配对命令')}>生成前端本机代理配对命令</button>
+              <button type="button" onClick={loadNodes}>刷新节点状态</button>
+            </div>
+            {pairCmd && <pre>{pairCmd.command_hint}</pre>}
+            {(nodesInfo?.nodes || []).length > 0 && <div className="table-scroll"><table><thead><tr><th>节点名称</th><th>模式</th><th>状态</th><th>版本</th><th>操作</th></tr></thead><tbody>{(nodesInfo?.nodes || []).map((n: Row) => <tr key={n.id}><td>{n.name}</td><td>{n.node_scope}</td><td>{n.status}</td><td>{n.vcat_version || '—'}</td><td><div className="button-row"><button type="button" className="text-button" onClick={() => c.run(async () => { await post(`/ops/nodes/${n.id}/probe`, {}); loadNodes(); }, '节点连接探测成功')}>探测连接</button>{n.id !== 'server-direct-default' && n.status !== 'revoked' && <button type="button" className="text-button" onClick={() => c.run(async () => { await post(`/ops/nodes/${n.id}/revoke`, {}); loadNodes(); }, '节点已吊销下线')}>吊销下线</button>}{n.id !== 'server-direct-default' && ['revoked', 'offline'].includes(n.status) && <button type="button" className="text-button" onClick={() => c.run(async () => { await api(`/ops/nodes/${n.id}`, { method: 'DELETE' }); loadNodes(); }, '离线节点已移除')}>移除节点</button>}</div></td></tr>)}</tbody></table></div>}
+          </div>}
           {tab === 'feishu' && <div className="schema-preview"><p>当前目标：<a href={settings?.feishu?.url} target="_blank" rel="noreferrer">打开飞书模板 ↗</a></p><div className="button-row"><button disabled={busy} onClick={async()=>{setBusy(true);await c.run(async()=>setSyncPreview(await post('/integrations/feishu/preview',{all_scopes:true,include_library:true})));setBusy(false)}}>预览全部现有数据</button><button disabled={busy||!schema?.ready||!syncPreview||!settings?.feishu?.enabled} onClick={async()=>{setBusy(true);await c.run(()=>post('/integrations/feishu/sync',{all_scopes:true}),'已提交全部范围三表同步，请在选题库任务中查看结果');setBusy(false)}}>同步全部博主、作品和评论</button></div>{syncPreview&&<Notice>三表数据：博主 {syncPreview.counts.authors}、作品 {syncPreview.counts.works}、平台评论 {syncPreview.counts.comments} 条。{syncPreview.library_counts&&<>材料：知识 {syncPreview.library_counts.knowledge}、专属写手 {syncPreview.library_counts.writers}、系统写手 {syncPreview.library_counts.builtin_writers}、稿件 {syncPreview.library_counts.drafts}、IP账号 {syncPreview.library_counts.ips} 条。</>}{syncPreview.notice}</Notice>}<div className="button-row"><button disabled={busy} onClick={async()=>{setBusy(true);await c.run(async()=>{setLibrarySchema(await post('/integrations/feishu/library/prepare',{}));setSchema(await api('/integrations/feishu/schema'))},'材料同步表已检查；保留模板字段和公式');setBusy(false)}}>准备材料同步表</button><button disabled={busy||!schema?.ready||!librarySchema?.ready||!syncPreview||!settings?.feishu?.enabled} onClick={async()=>{setBusy(true);await c.run(()=>post('/integrations/feishu/sync',{all_scopes:true,include_library:true}),'已提交全部数据与材料同步，请在选题库任务中查看结果');setBusy(false)}}>同步全部数据与材料</button></div><p className="muted">材料同步将IP账号、稿件对应到原有表，并为知识库和写手SKILL补齐专表。包含8个系统写手，保留末级目录、问答、规则与版本；不设置发布、采集或审核触发开关。</p>{librarySchema?.warnings?.map((w:string)=><p className="error-text" key={w}>{w}</p>)}<div className="button-row"><button disabled={busy} onClick={async()=>{setBusy(true);await c.run(async()=>setSchema(await api('/integrations/feishu/schema')));setBusy(false)}}>读取三表与字段</button><button disabled={busy} onClick={async()=>{setBusy(true);await c.run(async()=>setSchema(await post('/integrations/feishu/prepare',{})),'已检查同步字段');setBusy(false)}}>检查并准备同步字段</button></div><p className="muted">先保存授权方式与目标链接，再读取字段。更换目标链接会清除原表ID和字段映射，请重新读取后配置。本机 CLI 使用现有登录凭证；应用模式使用下方密钥。准备操作会为三表补齐缺失的文本列“获客空间ID”“内容结构”“获客空间·IP”；保留已有字段和公式。请为应用开通多维表格读写权限，并授权访问此Base。</p><p className="muted">映射分组：authors（博主）、works（作品）、comments（评论）。字段键可用 title、body、likes、followers、source、author_id、material_id 等；值填写飞书字段名或字段ID。关系字段仅在类型与目标表匹配时写入。</p>{schema&&<><BadgeSchema ready={schema.ready}/>{schema.warnings?.map((w:string)=><p className="error-text" key={w}>{w}</p>)}{Object.entries(schema.tables||{}).map(([k,t]:[string,any])=><div key={k}><strong>{t.name} · {t.table_id}</strong><p className="muted">{t.fields.length} 个字段 · 已映射 {Object.keys(t.mapping).length} 项</p><pre>{Object.entries(t.mapping).map(([local,field]:[string,any])=>`${local} → ${field.field_name}（类型${field.type}）`).join('\n')}</pre></div>)}</>}</div>}
         </Card>
       </div>

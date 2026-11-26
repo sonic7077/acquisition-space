@@ -124,12 +124,22 @@ export default function Schedules(c: Ctx) {
                       <Badge value={r.status} />
                     </td>
                     <td>
-                      <button
-                        className="text-button"
-                        onClick={() => setDetail(r)}
-                      >
-                        详情 / 微信生态
-                      </button>
+                      <div className="button-row">
+                        <button
+                          className="text-button"
+                          onClick={() => setDetail(r)}
+                        >
+                          详情 / 微信生态
+                        </button>
+                        {!["cancelled", "needs_review"].includes(r.status) && (
+                          <button
+                            className="text-button"
+                            onClick={() => c.go("ops-tasks", r.id)}
+                          >
+                            去运营派发
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -158,7 +168,7 @@ export default function Schedules(c: Ctx) {
             </Field>
             <Field label="发布平台">
               <select name="platform">
-                {["抖音", "视频号", "小红书"].map((p) => (
+                {["抖音", "视频号", "小红书", "哔哩哔哩", "公众号"].map((p) => (
                   <option key={p}>{p}</option>
                 ))}
               </select>

@@ -9,6 +9,9 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
+from backend.app.env import load_env_file
+
+load_env_file(ROOT / '.env')
 port = os.environ.get('ACQUISITION_PORT', '8787')
 from backend.app.main import create_app
 app = create_app()
@@ -27,6 +30,7 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
 try:
     processes.append(subprocess.Popen([sys.executable, '-m', 'backend.app.worker']))
+    processes.append(subprocess.Popen([sys.executable, '-m', 'backend.app.publish_worker']))
     processes.append(subprocess.Popen([sys.executable, '-m', 'uvicorn', 'backend.app.main:create_app', '--factory', '--host', '127.0.0.1', '--port', port]))
     while all(process.poll() is None for process in processes):
         time.sleep(1)

@@ -169,7 +169,7 @@ def test_feishu_maps_comment_evidence_fields_without_new_remote_schema(env):
     from backend.tests.test_collection import FeishuMock
     from backend.app.integrations.feishu import Feishu
     app, c, _, _ = env
-    c.put('/api/settings', json={'feishu': {'app_id': 'fake', 'app_secret': 'fake'}})
+    c.put('/api/settings', json={'feishu': {'url': 'https://example-tenant.feishu.cn/base/ExampleBaseToken001', 'app_id': 'fake', 'app_secret': 'fake'}})
     mock = FeishuMock()
     for i, name in enumerate(['评论类型', '判定依据', '规则版本', '人工覆盖', '负责人', '采集时间', '评论用户ID', '评论范围', '回复数']):
         mock.fields['tbl-comments'].append({'field_id': 'c-'+str(i), 'field_name': name, 'type': 2 if name == '回复数' else 1})
@@ -221,7 +221,7 @@ def test_feishu_comment_collection_time_supports_date_fields(env):
     from backend.tests.test_collection import FeishuMock
     from backend.app.integrations.feishu import Feishu
     app, c, _, _ = env
-    c.put('/api/settings', json={'feishu': {'app_id': 'fake', 'app_secret': 'fake'}})
+    c.put('/api/settings', json={'feishu': {'url': 'https://example-tenant.feishu.cn/base/ExampleBaseToken001', 'app_id': 'fake', 'app_secret': 'fake'}})
     mock = FeishuMock()
     mock.fields['tbl-comments'].append({'field_id': 'date', 'field_name': '采集时间', 'type': 5})
     app.state.integration_transport = httpx.MockTransport(mock)

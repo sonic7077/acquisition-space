@@ -16,6 +16,12 @@ import {
   ChevronRight,
   RefreshCw,
   PanelLeftClose,
+  UserCheck,
+  ShieldAlert,
+  Send,
+  Video,
+  MessagesSquare,
+  Activity,
 } from "lucide-react";
 import { api, post, type Row } from "./api";
 
@@ -35,6 +41,12 @@ import Schedules from "./pages/Schedules";
 import Reports from "./pages/Reports";
 import Authors from "./pages/Authors";
 import Help from "./pages/Help";
+import OpsAccounts from "./pages/ops/OpsAccounts";
+import OpsChallenges from "./pages/ops/OpsChallenges";
+import OpsTasks from "./pages/ops/OpsTasks";
+import OpsPosts from "./pages/ops/OpsPosts";
+import OpsInteractions from "./pages/ops/OpsInteractions";
+import OpsMonitors from "./pages/ops/OpsMonitors";
 const GROUPS = [
   { name: "", items: [["dashboard", "工作台", LayoutDashboard]] },
   {
@@ -45,6 +57,17 @@ const GROUPS = [
       ["drafts", "审稿", FileCheck],
       ["assets", "拍摄上传", Clapperboard],
       ["schedules", "发布排期", CalendarDays],
+    ],
+  },
+  {
+    name: "运营",
+    items: [
+      ["ops-accounts", "账号与授权", UserCheck],
+      ["ops-challenges", "授权中心", ShieldAlert],
+      ["ops-tasks", "发布任务", Send],
+      ["ops-posts", "作品与数据", Video],
+      ["ops-interactions", "评论与私信", MessagesSquare],
+      ["ops-monitors", "监控与告警", Activity],
     ],
   },
   {
@@ -85,6 +108,7 @@ export default function App() {
     [ip, setIp] = useState(""),
     [preferredWriter, setPreferredWriter] = useState<WriterPreference | null>(null),
     [selectedDraftId, setSelectedDraftId] = useState<string>(),
+    [selectedScheduleId, setSelectedScheduleId] = useState<string>(),
     [version, setVersion] = useState(0),
     [error, setError] = useState(""),
     [toast, setToast] = useState(""),
@@ -132,7 +156,8 @@ export default function App() {
   }, [page]);
   const go = (next: string, selectedId?: string) => {
     setSelectedDraftId(next === "drafts" ? selectedId : undefined);
-    if (next === "drafts" && selectedId) setIp("");
+    setSelectedScheduleId(next === "ops-tasks" ? selectedId : undefined);
+    if ((next === "drafts" || next === "ops-tasks") && selectedId) setIp("");
     location.hash = next;
     setPage(next);
     setError("");
@@ -322,6 +347,18 @@ export default function App() {
             <Assets key={ip} {...ctx} />
           ) : page === "schedules" ? (
             <Schedules {...ctx} />
+          ) : page === "ops-accounts" ? (
+            <OpsAccounts {...ctx} />
+          ) : page === "ops-challenges" ? (
+            <OpsChallenges {...ctx} />
+          ) : page === "ops-tasks" ? (
+            <OpsTasks key={selectedScheduleId || "ops-tasks"} {...ctx} initialScheduleId={selectedScheduleId} />
+          ) : page === "ops-posts" ? (
+            <OpsPosts {...ctx} />
+          ) : page === "ops-interactions" ? (
+            <OpsInteractions {...ctx} />
+          ) : page === "ops-monitors" ? (
+            <OpsMonitors {...ctx} />
           ) : page === "reports" ? (
             <Reports {...ctx} />
           ) : (

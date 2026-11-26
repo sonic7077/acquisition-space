@@ -61,7 +61,7 @@ API Key等敏感值在数据库内加密，响应只返回是否已配置；密�
 
 项目交付包含源码和运行所需的写手模板，业务数据、备份及本地同步附件单独保管。
 
-飞书默认使用[用户最新的爆款空间模板](https://wcn8zd3z0yjw.feishu.cn/wiki/Me3owpcvFirsbEkqMc9cZ7PLnAf)。管理员可在系统设置选择已授权的本机飞书 CLI，无需复制其密钥；也可使用 App ID / App Secret。系统会先把知识空间节点解析为真实多维表格，再核对博主、作品、评论表及字段。管理员可预览并提交全部现有三表数据；普通用户仍按已有IP与个人权限同步。更换链接后重新配置表ID和字段映射。
+飞书地址不在代码中硬编码。管理员可在「系统设置 → 飞书」填写企业多维表格或知识空间链接，或通过 `.env` 的 `FEISHU_DEFAULT_URL` / `FEISHU_ALLOWED_HOSTS` 指定默认地址与允许域名，也可选择已授权的本机飞书 CLI（无需复制其密钥）或使用 App ID / App Secret。系统会先把知识空间节点解析为真实多维表格，再核对博主、作品、评论表及字段。管理员可预览并提交全部现有三表数据；普通用户仍按已有IP与个人权限同步。更换链接后重新配置表ID和字段映射。
 
 截至2026-11-21，CLI权限已生效，完成59条现有材料真实同步和重复验收：637字段读回、6个原公式保留、重复新增0条。已补建知识库与写手SKILL专表，IP和稿件使用原模板表；不写发布/采集触发开关。后来导入的保险存档尚未批量同步到飞书。
 
@@ -115,13 +115,44 @@ npx playwright test
 
 测试默认连接8000；可通过 `E2E_BASE_URL` 指定测试地址。已有Chromium可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` 指定。浏览器测试会建立验收账号和样例记录，只能用于隔离的测试空间。
 
-运行时仅支持修改数据目录 `ACQUISITION_DATA_DIR`、本地端口 `ACQUISITION_PORT` 和HTTPS部署时的 `SECURE_COOKIE=1`；这些是进程启动参数。模型与业务集成凭证统一由系统设置管理。
+## 配置文件与部署说明
+
+1. **环境变量配置模板**：仓库仅提交公开模板 [.env.example](.env.example) 与 [executor/vcat_agent.env.example](executor/vcat_agent.env.example)，**真实 `.env` 与 `executor/vcat_agent.env` 已被 `.gitignore` 忽略，严禁提交到版本库**。
+   ```sh
+   cp .env.example .env
+   ```
+   主要启动配置项（由 `scripts/run.py`、`scripts/service.py` 自动加载，显式环境变量优先级更高）：
+
+   | 变量名 | 说明 | 默认值 / 示例 |
+   |---|---|---|
+   | `ACQUISITION_DATA_DIR` | 数据目录（SQLite、主密钥、资产、日志） | `.data` |
+   | `ACQUISITION_PORT` | HTTP 服务监听端口 | `8787` |
+   | `SECURE_COOKIE` | HTTPS 反向代理部署时设为 `1` | `0` |
+   | `FEISHU_DEFAULT_URL` | 可选，默认飞书知识空间或 Base 链接 | 留空，首次部署在系统设置填写 |
+   | `FEISHU_ALLOWED_HOSTS` | 可选，允许的飞书域名白名单（逗号分隔） | 留空（允许标准 `*.feishu.cn` / `*.larkoffice.com`） |
+   | `VCAT_MCP_URL` | 小V猫同机直连（`server_direct`）MCP 地址 | `http://127.0.0.1:3199/mcp` |
+   | `VCAT_MCP_TOKEN` | 可选，同机直连 MCP Token（建议优先在 Web 系统设置加密保存） | 留空 |
+   | `VCAT_MCP_MIN_INTERVAL` | 小V猫写工具调用最小间隔（秒） | `3.2` |
+
+2. **敏感业务凭证存放位置**：AI 模型 API Key、TikHub API Key、飞书 App Secret、公众号 App Secret、企微 Webhook、同机小V猫 MCP Token 等均在 **Web「系统设置」** 中填写，服务端使用 `.data/master.key` 加密后存入 `.data/system.db`，不在配置文件中明文留存。首次部署后请立即修改默认管理员 `admin/admin` 密码。
+3. **前后端及执行端依赖安装**：仓库**不提交任何第三方包实体**（`.venv/`、`node_modules/`、`dist/` 均在 `.gitignore`），仅提交锁定的包列表。部署或更换机器时从包列表安装：
+   - 服务端与发布/写作 worker：`uv sync --project backend --python 3.12 --locked`
+   - 前端静态资源：`npm --prefix frontend ci && npm --prefix frontend run build`
+   - 独立执行端代理（若在无 `uv` 的操作者电脑或独立桌面执行机运行）：`pip install -r executor/requirements.txt`
+4. **小V猫运营双配置模式部署**：一套后端 `/api/ops/*` 与前端「运营」页面同时支持两种部署拓扑：
+   - **服务器联通模式**（可在任何地点通过浏览器操作）：
+     - `server_direct`（同机直连）：后端与小V猫运行在同一台主机，在「系统设置 → 发布执行器」选择 `server_direct`，填写本机 MCP 地址（`http://127.0.0.1:3199/mcp`）与加密保存的 MCP Token。
+     - `server_relay`（服务端托管执行机）：Web 服务运行在云服务器，另在专用桌面执行机复制并配置 `executor/vcat_agent.env`，在 Web「系统设置 → 发布执行器」生成一次性配对码后启动：
+       `python3 executor/vcat_agent.py --mode server_managed --server https://<服务地址> --pair-token <配对码>`
+   - **Web 前端 + 本机小V猫模式**（`client_local`，小V猫装在操作者电脑）：操作者在自己电脑安装小V猫并开启会员态 MCP，复制 `executor/vcat_agent.env.example` 为 `executor/vcat_agent.env` 填写 `VCAT_MCP_TOKEN`，在 Web「系统设置 → 发布执行器」或「运营 → 账号与授权」生成个人配对码后启动：
+     `python3 executor/vcat_agent.py --mode client_local --server https://<服务地址> --pair-token <配对码>`
+   - 完整架构与接口设计见 [小V猫运营接入与双模式设计](docs/小V猫运营接入与双模式设计-2026-11-26.md)。
 
 ## 当前外部接入范围
 
 模型客户端已用受控本地模型服务验证请求、鉴权和返回入稿；TikHub抖音、小红书、视频号采集与飞书三表同步已实现适配，并使用隔离的接口测试和浏览器验收。飞书已使用授权CLI完成真实同步验收，TikHub仍以隔离接口验证为主。
 
-语音转写、公众号草稿推送、企微外发和Windows RPA目前仍只有集中配置入口，尚未实现对应平台适配与真实联调。上传、暂存或写作建议不等于公开发表或已回复客户。
+运营与发布模块已通过「运营」主菜单与 `publish_worker` 接入小V猫 MCP（支持 `server_direct` / `server_relay` / `client_local` / `hybrid` 双模式架构、iframe 无感上号、视频号扫脸二维码、账号移除与节点吊销、草稿一键转正式发布、作品趋势与分日明细、受控互动回复开关及异常作品隐藏），公众号首期走官方草稿箱 API 或人工草稿暂存并严格隔离为 `DRAFT_PUSHED`；线上删除作品入口暂保持「暂不开放」。语音转写备选外部服务和企微外发仍保留配置入口。上传、草稿暂存或写作建议不等于公开发表或已回复客户。
 
 ## TikHub采集与飞书同步
 

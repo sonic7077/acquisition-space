@@ -50,7 +50,7 @@ test('管理员阈值设置与帮助说明',async({page})=>{
   await expect(page.getByRole('heading',{name:'从采集到运营'})).toBeVisible();
   await expect(page.getByText('推荐倍数 ≥ 4',{exact:true})).toBeVisible();
   await expect(page.getByText('本地 → 飞书',{exact:true})).toBeVisible();
-  await expect(page.getByText('真实RPA发布尚未接通',{exact:true})).toBeVisible();
+  await expect(page.getByRole('heading',{name:'运营发布与多模式执行',exact:true})).toBeVisible();
   await page.screenshot({path:'/tmp/huoke-discovery-help.png',fullPage:true});
   await page.setViewportSize({width:390,height:844});
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBeTruthy();

@@ -33,7 +33,7 @@ test('管理员选择CLI认证并显示明确的权限不足提示',async({page}
   await page.getByRole('button',{name:'系统设置',exact:true}).click();
   await page.locator('.settings-nav').getByRole('button',{name:'飞书',exact:true}).click();
   await page.locator('select[name="auth_mode"]').selectOption('cli');
-  await page.locator('input[name="url"]').fill('https://wcn8zd3z0yjw.feishu.cn/wiki/Me3owpcvFirsbEkqMc9cZ7PLnAf');
+  await page.locator('input[name="url"]').fill('https://example-tenant.feishu.cn/wiki/ExampleWikiToken12345');
   await page.getByRole('button',{name:'保存设置',exact:true}).click();
   await expect(page.locator('select[name="auth_mode"]')).toHaveValue('cli');
   await page.route('**/api/integrations/feishu/schema',route=>route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({detail:'飞书 CLI 权限不足（99991672）：请开通多维表格读写权限'})}));
