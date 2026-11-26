@@ -12,15 +12,12 @@ export default function Assets(c: Ctx) {
     [target, setTarget] = useState(""),
     [tele, setTele] = useState<Row | null>(null);
   const input = useRef<HTMLInputElement>(null);
+  const selectedDraft = drafts.find((draft) => draft.id === target);
   async function upload(files: FileList | null) {
-    if (!target) {
-      c.notify("请选择明确的批准稿件后上传");
-      return;
-    }
-    if (!files) return;
+    if (!selectedDraft || !files) return;
     for (const f of Array.from(files)) {
       const form = new FormData();
-      form.append("draft_id", target);
+      form.append("draft_id", selectedDraft.id);
       form.append("file", f);
       await c.run(
         () => api("/assets", { method: "POST", body: form }),
@@ -59,17 +56,19 @@ export default function Assets(c: Ctx) {
           ) : (
             <Empty
               title="暂无已批准稿件"
-              body="请由团队长或管理员先完成审稿。"
-            />
+              body="当前 IP 范围内的稿件需由团队长或管理员批准后才能上传。"
+            >
+              <button onClick={() => c.go("drafts")}>前往审稿</button>
+            </Empty>
           )}
         </Card>
         <Card
           title="视频与封面投递箱"
-          subtitle="先选择稿件，确认IP与版本，再上传关联资产"
+          subtitle="选择已批准稿件，上传的文件将关联到该 IP 和批准版本"
         >
           <Field label="明确关联稿件">
-            <select value={target} onChange={(e) => setTarget(e.target.value)}>
-              <option value="">请选择已批准稿件</option>
+            <select value={selectedDraft?.id ?? ""} disabled={!drafts.length} onChange={(e) => setTarget(e.target.value)}>
+              <option value="">{drafts.length ? "请选择已批准稿件" : "暂无可选稿件"}</option>
               {drafts.map((d) => (
                 <option key={d.id} value={d.id}>
                   {c.ips.find((i) => i.id === d.ip_id)?.name} / {d.title} / v
@@ -78,21 +77,25 @@ export default function Assets(c: Ctx) {
               ))}
             </select>
           </Field>
-          <button className="dropzone" onClick={() => input.current?.click()}>
+          {!selectedDraft && <p className="muted" id="upload-requirement">
+            {drafts.length ? "选择稿件后即可上传视频。" : "稿件批准后，即可在这里选择并上传。"}
+          </p>}
+          <button className="dropzone" disabled={!selectedDraft} aria-describedby={selectedDraft ? undefined : "upload-requirement"} onClick={() => input.current?.click()}>
             <Upload size={32} />
             <strong>选择视频与封面</strong>
-            <span>MP4 / MOV / PNG / JPEG，单文件100MB</span>
+            <span>视频 MP4 / MOV · 封面 PNG / JPG / JPEG · 单文件 ≤ 100 MB</span>
           </button>
           <input
             hidden
             multiple
             ref={input}
+            disabled={!selectedDraft}
             type="file"
             accept=".mp4,.mov,.png,.jpg,.jpeg"
             onChange={(e) => upload(e.target.files)}
           />
           <Notice>
-            上传成功仅表示资产就绪，不会自动发表。语音自动匹配尚未接入，当前采用明确稿件关联。
+            视频可以单独上传，封面可稍后补传。上传后可在「已关联媒体资产」下载核对，再前往发布排期。
           </Notice>
         </Card>
       </div>

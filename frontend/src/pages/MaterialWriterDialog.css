@@ -1,0 +1,29 @@
+.transcript-status {
+  margin-block: 12px;
+}
+.transcript-status p {
+  margin-block: 8px;
+}
+.transcript-progress-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+.transcript-progress-label strong {
+  font-variant-numeric: tabular-nums;
+}
+.transcript-status progress {
+  display: block;
+  width: 100%;
+  height: 10px;
+  accent-color: var(--primary);
+}
+.transcript-feishu {
+  display: flex;
+  align-items: baseline;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+}

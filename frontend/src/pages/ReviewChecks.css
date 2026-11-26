@@ -20,6 +20,7 @@
 .review-checks .check-result > div { min-width: 0; }
 .review-checks .check-result small { color: #54647b; margin-top: 3px; }
 .review-checks .check-result.advisory > span { background: #fff4d6; color: #825a09; }
+.review-fact-action { margin-top: 8px; }
 .review-overlap {
   border-top: 1px solid var(--border);
   margin-top: 12px;
@@ -43,8 +44,9 @@
   font-size: 12px;
   overflow-wrap: anywhere;
 }
-.review-snippets li > p { margin: 0 0 4px; }
-.review-snippets li span { color: #54647b; margin-right: 8px; }
+.review-snippets li > p { margin: 0 0 4px; font-size: 13px; white-space: pre-wrap; }
+.review-fragment { margin: 3px 0; line-height: 1.7; }
+.review-fragment span { color: #54647b; margin-right: 8px; }
 .review-snippets mark {
   background: #fdf1ee;
   color: #a32020;

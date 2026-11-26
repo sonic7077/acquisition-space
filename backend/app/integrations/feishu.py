@@ -1,5 +1,9 @@
 """Schema-aware, idempotent three-table synchronization into the user's Base."""
+from hashlib import sha256
 import json
+import logging
+from uuid import UUID
+
 import httpx
 from sqlalchemy import select
 from ..db import Record, User, as_record, now
@@ -10,6 +14,7 @@ from .feishu_target import resolve
 from .common import config, client, claim, finish, update, authorized, IntegrationError
 
 ROOT = 'https://open.feishu.cn/open-apis'
+LOGGER = logging.getLogger(__name__)
 TABLE_NAMES = {'authors': '博主', 'works': '作品', 'comments': '评论'}
 KINDS = {'authors': 'authors', 'works': 'materials', 'comments': 'leads'}
 # Only mapped editable fields are written. Formula/lookup/system fields are excluded.
@@ -135,24 +140,39 @@ class Feishu:
             seen.add(token)
         raise IntegrationError('飞书分页超过范围或游标异常，已停止')
 
+    def table(self, key, available):
+        tid = self.cfg.get(key + '_table_id')
+        matches = [t for t in available if (t['table_id'] == tid if tid else t['name'] == TABLE_NAMES[key])]
+        if len(matches) != 1:
+            return None
+        table = dict(matches[0])
+        table['fields'] = self.items(self.path(table['table_id']) + '/fields')
+        mapping = self.mapping.get(key, {})
+        table['mapping'] = {}
+        aliases_by_field = {**ALIASES, 'transcript': ['逐字稿']} if key == 'works' else ALIASES
+        for local, aliases in aliases_by_field.items():
+            explicit = mapping.get(local)
+            found = next((f for f in table['fields'] if (explicit in (f['field_name'], f['field_id']) if explicit else f['field_name'] in aliases)), None)
+            allowed = (1,) if local == 'transcript' else (1, 2, 3, 4, 5, 7, 15, 18, 21)
+            if found and found['type'] in allowed:
+                table['mapping'][local] = found
+        if key == 'works':
+            reserved = {'逐字稿'}
+            if transcript := table['mapping'].get('transcript'):
+                reserved.add(transcript['field_name'])
+            for local, field in list(table['mapping'].items()):
+                if local != 'transcript' and field['field_name'] in reserved:
+                    del table['mapping'][local]
+        return table
+
     def schema(self):
         available = self.items(self.path())
         tables, warnings = {}, []
         for key, name in TABLE_NAMES.items():
-            tid = self.cfg.get(key + '_table_id')
-            matches = [t for t in available if (t['table_id'] == tid if tid else t['name'] == name)]
-            if len(matches) != 1:
+            table = self.table(key, available)
+            if not table:
                 warnings.append(f'无法唯一识别{name}表，请管理员填写表ID')
                 continue
-            table = dict(matches[0])
-            table['fields'] = self.items(self.path(table['table_id']) + '/fields')
-            mapping = self.mapping.get(key, {})
-            table['mapping'] = {}
-            for local, aliases in ALIASES.items():
-                explicit = mapping.get(local)
-                found = next((f for f in table['fields'] if (explicit in (f['field_name'], f['field_id']) if explicit else f['field_name'] in aliases)), None)
-                if found and found['type'] in (1, 2, 3, 4, 5, 7, 15, 18, 21):
-                    table['mapping'][local] = found
             unique = table['mapping'].get('local_id')
             structure = table['mapping'].get('structure')
             if not unique or unique['type'] != 1 or not structure or structure['type'] != 1:
@@ -176,7 +196,7 @@ class Feishu:
     def fields(self, table, row, refs):
         data = as_record(row)
         # Complete normalized structure, including local and remote relation IDs.
-        data = {k: v for k, v in data.items() if not k.startswith('feishu_')}
+        data = {k: v for k, v in data.items() if not k.startswith('feishu_') and k != 'transcript'}
         data['relations'] = {k: refs.get(data.get(k)) for k in ('author_id', 'material_id') if data.get(k)}
         data['platform_label']={'douyin':'抖音','xiaohongshu':'小红书','wechat_channels':'视频号'}.get(data.get('platform'),data.get('platform'))
         data['local_id'] = row.id
@@ -211,19 +231,50 @@ class Feishu:
                     fields[name] = [target['record_id']]
         return fields
 
-    def upsert(self, table, row, refs):
+    def find_record(self, table, row):
         path = self.path(table['table_id']) + '/records'
-        unique = table['mapping']['local_id']['field_name']
+        unique = table['mapping']['local_id']
         result = self.request('POST', path + '/search', {'filter': {'conjunction': 'and', 'conditions': [
-            {'field_name': unique, 'operator': 'is', 'value': [row.id]}]}}, page_size=100)
+            {'field_name': unique['field_name'], 'operator': 'is', 'value': [row.id]}]}}, page_size=100)
         existing = result.get('items') or []
         if len(existing) > 1 or result.get('has_more'):
-            raise IntegrationError('飞书唯一ID有重复，请先人工核对重复行')
+            raise SyncConflict(table, row, [])
+        if not existing:
+            return None
+        record = existing[0]
+        if not record.get('record_id') or comparable((record.get('fields') or {}).get(unique['field_name']), unique) != row.id:
+            raise SyncConflict(table, row, [])
+        return record
+
+    def create_work_record(self, table, row, fields):
+        path = self.path(table['table_id']) + '/records'
+        token = str(UUID(bytes=sha256(f'{ROOT}{path}/{row.id}'.encode()).digest()[:16], version=4))
+        try:
+            result = self.request('POST', path, {'fields': fields}, client_token=token)
+        except IntegrationError:
+            existing = self.find_record(table, row)
+            if existing:
+                return existing
+            raise
+        # Collection and transcription can arrive together. A replay may
+        # return the other's record, so verify the actual cells by work ID.
+        existing = self.find_record(table, row)
+        if not existing or existing['record_id'] != (result.get('record') or {}).get('record_id'):
+            raise IntegrationError('飞书新建作品结果无法确认，请核对作品表后重试')
+        return existing
+
+    def upsert(self, table, row, refs):
+        path = self.path(table['table_id']) + '/records'
+        existing = self.find_record(table, row)
         fields = self.fields(table, row, refs)
+        create = existing is None
+        if create and row.kind == 'materials':
+            existing = self.create_work_record(table, row, fields)
         if existing:
             previous = row.payload.get('feishu_snapshot', {}) if row.payload.get('feishu_table_id') == table['table_id'] else {}
-            remote = existing[0].get('fields') or {}
+            remote = existing.get('fields') or {}
             differences = []
+            fill_empty = False
             for field in table['mapping'].values():
                 name = field['field_name']
                 if name not in fields:
@@ -231,10 +282,16 @@ class Feishu:
                 baseline = previous.get(name, fields[name])
                 actual = comparable(remote.get(name), field)
                 if actual != comparable(baseline, field):
+                    if row.kind == 'materials' and name not in previous and actual == comparable(None, field):
+                        fill_empty = True
+                        continue
                     differences.append({'field': name, 'last_sync': baseline, 'local': fields[name], 'feishu': actual})
             if differences:
                 raise SyncConflict(table, row, differences)
-            result = self.request('PUT', path + '/' + existing[0]['record_id'], {'fields': fields})
+            if not create or fill_empty:
+                result = self.request('PUT', path + '/' + existing['record_id'], {'fields': fields})
+            else:
+                result = {'record': existing}
         else:
             result = self.request('POST', path, {'fields': fields})
         rid = (result.get('record') or {}).get('record_id')
@@ -242,6 +299,107 @@ class Feishu:
             raise IntegrationError('飞书写入结果缺少记录ID，请核对后重试')
         self.last_fields = fields
         return {'table_id': table['table_id'], 'record_id': rid}
+
+
+def transcript_cell(value):
+    if value is None or isinstance(value, str):
+        return value or ''
+    if isinstance(value, list) and all(isinstance(part, dict) and isinstance(part.get('text'), str)
+                                      and part.get('type', 'text') == 'text' for part in value):
+        return ''.join(part['text'] for part in value)
+    return None
+
+
+def work_author_ref(app, material, table):
+    author_field = table['mapping'].get('author_id', {})
+    author_table = author_field.get('property', {}).get('table_id')
+    author_id = material.payload.get('author_id')
+    if not author_table or not author_id:
+        return {}
+    with app.state.Session() as db:
+        author = db.get(Record, author_id)
+        if author and author.kind == 'authors' and author.ip_id == material.ip_id:
+            record_id = author.payload.get('feishu_record_id')
+            if record_id and author.payload.get('feishu_table_id') == author_table:
+                return {author_id: {'record_id': record_id, 'table_id': author_table}}
+    return {}
+
+
+def save_work_binding(app, material_id, table_id, record_id, initial_fields=None):
+    with app.state.Session() as db:
+        db.connection().exec_driver_sql('BEGIN IMMEDIATE')
+        row = db.get(Record, material_id)
+        if not row or row.kind != 'materials':
+            return
+        payload = dict(row.payload)
+        same_record = payload.get('feishu_table_id') == table_id and payload.get('feishu_record_id') == record_id
+        if initial_fields is not None and (not same_record or 'feishu_snapshot' not in payload):
+            payload.update(feishu_snapshot=initial_fields, feishu_synced_at=now())
+        elif not same_record:
+            payload.pop('feishu_snapshot', None)
+            payload.pop('feishu_synced_at', None)
+        row.payload = {**payload, 'feishu_table_id': table_id, 'feishu_record_id': record_id}
+        db.commit()
+
+
+def sync_work_transcript(app, material, text, *, before=None):
+    snapshot = config(app, 'feishu')
+    if not snapshot.get('enabled'):
+        return {'status': 'skipped', 'message': '飞书同步未启用，逐字稿已保留在本地'}
+    if not isinstance(text, str) or not text.strip():
+        return {'status': 'skipped', 'message': '逐字稿为空'}
+
+    def check_config():
+        if config(app, 'feishu') != snapshot:
+            raise IntegrationError('管理员已变更飞书设置，请重新同步逐字稿')
+        if before:
+            before()
+
+    api = None
+    try:
+        api = Feishu(app, snapshot, before=check_config)
+        table = api.table('works', api.items(api.path()))
+        if not table:
+            raise IntegrationError('无法唯一识别飞书作品表，请核对系统设置中的表ID')
+        mapping = table['mapping']
+        transcript = mapping.get('transcript')
+        if not transcript:
+            raise IntegrationError('飞书作品表缺少可编辑的文本字段「逐字稿」')
+        if not mapping.get('local_id') or mapping['local_id']['type'] != 1:
+            raise IntegrationError('飞书作品表缺少文本字段「获客空间ID」，请先准备同步字段')
+        tid = table['table_id']
+        field_name = transcript['field_name']
+        path = api.path(tid) + '/records'
+        remote = api.find_record(table, material)
+        initial_fields = None
+        if not remote:
+            if material.payload.get('feishu_table_id') == tid and material.payload.get('feishu_record_id'):
+                return {'status': 'conflict', 'message': '已关联的飞书作品标识缺失，请核对作品表中的获客空间ID'}
+            desired = api.fields(table, material, work_author_ref(app, material, table))
+            remote = api.create_work_record(table, material, {**desired, field_name: text})
+            actual = remote.get('fields') or {}
+            initial_fields = {name: actual.get(name) for name in desired}
+        rid = remote['record_id']
+        current = transcript_cell((remote.get('fields') or {}).get(field_name))
+        if current is None or current.strip() and current != text:
+            return {'status': 'conflict', 'message': '飞书作品已有不同逐字稿，已保留原稿及本地转写结果'}
+        if current != text:
+            result = api.request('PUT', f'{path}/{rid}', {'fields': {field_name: text}})
+            if (result.get('record') or {}).get('record_id') != rid:
+                raise IntegrationError('飞书写入结果无法确认，请核对作品表后重试')
+        check_config()
+        save_work_binding(app, material.id, tid, rid, initial_fields)
+        return {'status': 'synced', 'message': '逐字稿已同步到飞书作品表'}
+    except SyncConflict:
+        return {'status': 'conflict', 'message': '飞书作品表的获客空间ID有重复或不一致，请核对对应记录'}
+    except IntegrationError as exc:
+        return {'status': 'failed', 'message': str(exc)}
+    except Exception:
+        LOGGER.warning('Unexpected Feishu transcript sync error for material %s', material.id)
+        return {'status': 'failed', 'message': '飞书逐字稿同步异常，请核对作品表后重试'}
+    finally:
+        if api:
+            api.http.close()
 
 
 def sync_rows(db,kind,run):

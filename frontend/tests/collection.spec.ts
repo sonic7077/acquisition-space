@@ -72,7 +72,8 @@ test('默认全部和平台过滤，搜索无需IP，未归属素材写稿时选
   await page.route('**/api/collection/runs',r=>r.fulfill({json:[]}));
   await page.route('**/api/records/materials',r=>r.fulfill({json:[{id:'unassigned-xhs',ip_id:null,platform:'小红书',transcript_supported:true,title:'低赞笔记也展示',likes:1,eligible:false,comments_status:'completed',collected_comments:2,status:'new'},{id:'wx-work',ip_id:null,platform:'视频号',title:'视频号内容',likes:200,status:'excluded'}]}));
   await page.route('**/api/collection/search',async r=>{submitted=r.request().postDataJSON();await r.fulfill({json:{id:'unassigned-run'}})});
-  await page.route('**/api/materials/unassigned-xhs/transcript',r=>{
+  await page.route(/\/api\/materials\/unassigned-xhs\/transcript(?:\?|$)/,r=>{
+    if (r.request().method() === 'GET') return r.fulfill({json:{status:'idle',progress:0,stage:''}});
     transcriptRequests++;
     return r.fulfill({json:{text:'这段话来自原视频的转写。',source:'speech_recognition',cached:false}});
   });
@@ -104,11 +105,18 @@ test('自动转写失败可重试，返回结果保留用户手工录入', async
     {id:'video-retry',ip_id:ip.id,title:'转写重试素材',platform:'视频号',transcript_supported:true},
   ]}));
   let calls = 0;
-  await page.route('**/api/materials/video-retry/transcript', route => {
+  await page.route(/\/api\/materials\/video-retry\/transcript(?:\?|$)/, route => {
+    if (route.request().method() === 'GET') {
+      return route.fulfill({ json: calls < 2
+        ? { status: 'idle', progress: 0, stage: '' }
+        : { status: 'completed', progress: 100, stage: '逐字稿已保存', text: '后台辨识到的原始语音。' },
+      });
+    }
+    expect(new URL(route.request().url()).searchParams.get('background')).toBe('true');
     calls++;
     return calls === 1
       ? route.fulfill({status:422,json:{detail:'本次未能读取视频音轨'}})
-      : route.fulfill({json:{text:'后台辨识到的原始语音。',cached:false}});
+      : route.fulfill({status:202,json:{status:'queued',progress:0,stage:'已排队'}});
   });
   await openTopicCollection(page);
   await page.getByRole('button',{name:'调用写手',exact:true}).click();
@@ -122,6 +130,54 @@ test('自动转写失败可重试，返回结果保留用户手工录入', async
   await dialog.getByRole('button',{name:'填入自动转写结果',exact:true}).click();
   await expect(reference).toHaveValue('后台辨识到的原始语音。');
   expect(calls).toBe(2);
+});
+
+test('逐字稿展示真实进度，飞书回写失败后可单独重试', async ({ page }) => {
+  await page.route('**/api/records/materials', route => route.fulfill({ json: [
+    { id: 'video-progress', ip_id: null, title: '进度验收素材', platform: '抖音', transcript_supported: true },
+  ] }));
+  let extractionCalls = 0, syncCalls = 0;
+  let progress = 24, stage = '正在下载视频', syncReady = false;
+  await page.route(/\/api\/materials\/video-progress\/transcript(?:\?|$)/, async route => {
+    if (route.request().method() === 'POST') {
+      extractionCalls++;
+      return route.fulfill({ status: 202, json: { status: 'queued', progress: 0, stage: '已排队' } });
+    }
+    if (progress < 100) return route.fulfill({ json: { status: 'running', progress, stage } });
+    return route.fulfill({ json: {
+      status: 'completed', progress, stage, text: '后台转写的逐字稿。', cached: false,
+      feishu: syncReady ? { status: 'failed', message: '飞书暂时无法写入' } : { status: 'pending' },
+    } });
+  });
+  await page.route('**/api/materials/video-progress/transcript/feishu', route => {
+    syncCalls++;
+    return route.fulfill({ json: { status: 'synced', message: '已同步到飞书作品表' } });
+  });
+  await openTopicCollection(page);
+  await page.getByRole('button', { name: '调用写手', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '素材调用写手' });
+  const bar = dialog.getByRole('progressbar', { name: '逐字稿提取进度' });
+  await expect(bar).toHaveAttribute('value', '24');
+  await expect(dialog).toContainText('正在下载视频');
+  const reference = dialog.getByLabel('对标逐字稿', { exact: true });
+  await reference.fill('等待转写时输入的手工原话。');
+  progress = 72;
+  stage = '正在转写语音';
+  await expect(bar).toHaveAttribute('value', '72');
+  await expect(dialog).toContainText('正在转写语音');
+  progress = 100;
+  stage = '逐字稿已保存';
+  await expect(bar).toHaveAttribute('value', '100');
+  await expect(dialog).toContainText('正在同步飞书');
+  syncReady = true;
+  await expect(dialog).toContainText('飞书暂时无法写入');
+  await expect(reference).toHaveValue('等待转写时输入的手工原话。');
+  await dialog.getByRole('button', { name: '重试同步飞书' }).click();
+  await expect(dialog).toContainText('已同步到飞书作品表');
+  await dialog.getByRole('button', { name: '填入自动转写结果' }).click();
+  await expect(reference).toHaveValue('后台转写的逐字稿。');
+  expect(extractionCalls).toBe(0);
+  expect(syncCalls).toBe(1);
 });
 
 async function openTopicCollection(page: Page) {

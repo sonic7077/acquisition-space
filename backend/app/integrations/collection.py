@@ -7,6 +7,7 @@ from ..demand_analysis import labels, analyze_comment
 from ..db import Record, as_record, business_today, now
 from .common import config, client, claim, update, finish, queue, authorized, lease, IntegrationError
 from . import tikhub, platforms
+from .transcript import enqueue_transcript
 
 
 def stable(kind, ip_id, key, platform='douyin'):
@@ -174,6 +175,7 @@ class Collector:
                                     m.update({'author_id':author_row.id if author_row else None,'keyword':keyword,'collected_at':now(),
                                               'comments_status':'pending'})
                                     row=upsert(db,'materials',self.run['ip_id'],self.run['owner_id'],m['platform_id'],m)
+                                    enqueue_transcript(db, row, self.run['owner_id'])
                                     material=as_record(row)
                                     candidates[row.id]=material;platform_materials[row.id]=material
                                     if raw_id:seen_results[raw_id]=material

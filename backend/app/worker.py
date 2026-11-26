@@ -1,4 +1,6 @@
 """Separate durable writer worker; safe failures, bounded requests, permission recheck."""
+import logging
+from threading import Thread
 import time
 from datetime import datetime, timedelta, timezone
 import httpx
@@ -22,6 +24,11 @@ def sources_current(db, ctx):
 
 
 def run_once(app):
+    from .integrations.transcript import run_next_transcript
+    return run_primary(app) or run_next_transcript(app)
+
+
+def run_primary(app):
     Session = app.state.Session
     (app.state.data_dir / 'worker-heartbeat').write_text(now())
     from .integrations.common import pending
@@ -130,10 +137,22 @@ def run_once(app):
 
 
 def main():
+    from .integrations.transcript import run_next_transcript
     from .main import create_app
     app = create_app()
+
+    def transcribe():
+        while True:
+            try:
+                worked = run_next_transcript(app)
+            except Exception as exc:
+                logging.getLogger(__name__).warning('Transcript worker failed (%s); will check the queue again', type(exc).__name__)
+                worked = False
+            time.sleep(1 if worked else 5)
+
+    Thread(target=transcribe, name='material-transcript', daemon=True).start()
     while True:
-        worked = run_once(app)
+        worked = run_primary(app)
         time.sleep(1 if worked else 5)
 
 

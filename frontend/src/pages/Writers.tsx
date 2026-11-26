@@ -12,6 +12,7 @@ import { Badge, Empty, Card, Modal, Field, Notice } from "../components/ui";
 import { type Ctx, useRows, IpSelect } from "../context";
 import DefaultWriters from "./DefaultWriters";
 import WriterProfiles from "./WriterProfiles";
+import LeadDemandSelect, { effectiveLeadsForIp } from "./LeadDemandSelect";
 
 export default function Writers({
   onRewrite,
@@ -59,7 +60,7 @@ function WriterTools(c: Ctx) {
       (rule) => rule.ip_id === target,
     ),
     drafts = useRows("/drafts", c.version),
-    needs = useRows("/records/needs", c.version),
+    leads = useRows("/records/leads", c.version),
     writers = useRows("/writers", c.version),
     analyses = useRows("/writing/analyses", c.version).filter(
       (result) => !target || result.ip_id === target,
@@ -72,6 +73,8 @@ function WriterTools(c: Ctx) {
     [busy, setBusy] = useState(false),
     [profile, setProfile] = useState(false),
     [ruleModal, setRuleModal] = useState<Row | null>(null);
+  const demands = effectiveLeadsForIp(leads, target);
+  const selectedNeedId = demands.some((lead) => lead.id === needId) ? needId : "";
   async function action(generate = false) {
     if (!target || !topic.trim()) {
       c.notify("请选择目标IP并填写主题");
@@ -84,7 +87,7 @@ function WriterTools(c: Ctx) {
           ip_id: target,
           topic,
           skill,
-          need_id: needId || null,
+          need_id: selectedNeedId || null,
           ...(!writerId
             ? { writer_id: "default:" + skill, writer_version: 1 }
             : {}),
@@ -150,26 +153,15 @@ function WriterTools(c: Ctx) {
                   ))}
               </select>
             </Field>
-            <Field label="关联需求（可选）">
-              <select
-                aria-label="关联需求（可选）"
-                value={needId}
-                onChange={(e) => {
-                  setNeedId(e.target.value);
-                  setContext(null);
-                }}
-              >
-                <option value="">不关联需求</option>
-                {needs
-                  .filter((n) => n.ip_id === target && n.status !== "expired")
-                  .map((n) => (
-                    <option key={n.id} value={n.id}>
-                      {n.title} ·{" "}
-                      {n.topic_id ? `${n.count}条有效需求` : "手工登记"}
-                    </option>
-                  ))}
-              </select>
-            </Field>
+            <LeadDemandSelect
+              leads={demands}
+              label="关联需求（可选）"
+              value={selectedNeedId}
+              onChange={(id) => {
+                setNeedId(id);
+                setContext(null);
+              }}
+            />
             <Field label="内容主题与要求">
               <textarea
                 rows={4}

@@ -28,6 +28,23 @@ function sourcePlatform(r:Row) {
   return '其他';
 }
 const commentLabel=(r:Row)=>r.comments_status==='legacy_partial'?'历史存档评论，非全量':r.comments_status==='failed'?'评论入库失败':r.comments_status==='pending'?'评论自动入库中':r.comments_has_more?'已采本次页数，仍有更多评论':r.comments_fetched_at?'本次评论已入库':'尚未采集';
+function transcriptLabel(row: Row) {
+  switch (row.transcript_status) {
+    case 'queued': return '逐字稿已排队';
+    case 'running': return `逐字稿提取中 ${row.transcript_progress ?? 0}%`;
+    case 'completed': {
+      const syncLabels: Record<string, string> = {
+        pending: '逐字稿已保存 · 飞书同步中',
+        synced: '逐字稿已写入飞书',
+        failed: '逐字稿已保存 · 飞书同步失败',
+        conflict: '逐字稿已保存 · 飞书已有稿件',
+      };
+      return syncLabels[row.transcript_feishu_status] || '逐字稿已保存';
+    }
+    case 'failed': return '逐字稿提取失败';
+    default: return row.transcript_supported ? '逐字稿待提取' : '';
+  }
+}
 export default function Topics(c:Ctx & {preferredWriter?: WriterPreference | null}) {
   const [pulse,setPulse]=useState(0),[service,setService]=useState<Row>({}),[target,setTarget]=useState(c.ip),
     [keywords,setKeywords]=useState(''),[advanced,setAdvanced]=useState(false),[busy,setBusy]=useState(false),
@@ -40,7 +57,12 @@ export default function Topics(c:Ctx & {preferredWriter?: WriterPreference | nul
   const rows=filterIp(useRows('/records/materials',version),c.ip),authors=useRows('/records/authors',version),runs=filterIp(useRows('/collection/runs',version),c.ip);
   useEffect(()=>{api<Row>('/collection/status').then(setService).catch(()=>{});},[version]);
   const active=runs.some(r=>['queued','running'].includes(r.status));
-  useEffect(()=>{if(!active)return;const timer=setInterval(()=>setPulse(v=>v+1),3000);return()=>clearInterval(timer);},[active]);
+  const processingTranscripts=rows.some(r=>['queued','running'].includes(r.transcript_status)||r.transcript_feishu_status==='pending');
+  useEffect(()=>{
+    if (!active && !processingTranscripts) return;
+    const timer = window.setInterval(() => setPulse(value => value + 1), 3000);
+    return () => window.clearInterval(timer);
+  }, [active, processingTranscripts]);
   useEffect(()=>setTarget(c.ip),[c.ip]);
   useEffect(()=>setPage(1),[q,tab,source,sort,c.ip]);
   const shown=rows.filter(r=>(tab==='all'||tab==='recommended'&&r.discovery?.recommended||tab==='candidate'&&r.discovery?.candidate||tab==='rising'&&r.discovery?.rising||tab==='low_fan'&&r.discovery?.low_fan_hit||tab==='unknown_time'&&['unknown','future'].includes(r.discovery?.freshness)||tab==='excluded'&&r.status==='excluded'||tab==='adopted'&&r.status==='adopted'||tab==='available'&&r.discovery?.available)&&(source==='all'||sourcePlatform(r)===source)&&`${r.title} ${r.body||''} ${authors.find(a=>a.id===r.author_id)?.title||r.author||''} ${(r.keywords||[r.keyword]).join(' ')}`.toLowerCase().includes(q.toLowerCase()))
@@ -56,7 +78,7 @@ export default function Topics(c:Ctx & {preferredWriter?: WriterPreference | nul
     if(!options)return;
     setBusy(true);
     try {
-      await c.run(()=>post('/collection/search',options),'搜索任务已提交，作品及评论会自动入库');
+      await c.run(()=>post('/collection/search',options),'搜索任务已提交，视频入库后将自动排队转写');
     } finally {
       setBusy(false);
     }
@@ -83,13 +105,14 @@ export default function Topics(c:Ctx & {preferredWriter?: WriterPreference | nul
     <Card title="爆款素材" subtitle={`当前范围 ${rows.length} 条内容 · 默认全部展示 · 筛选后 ${shown.length} 条`} action={<div className="button-row"><button onClick={()=>document.getElementById('topic-search')?.scrollIntoView({behavior:'smooth',block:'start'})}><Search size={15}/>关键词搜索</button><button disabled={!service.feishu_enabled} onClick={()=>c.run(()=>post('/integrations/feishu/sync',{ip_id:target||null}),'已提交三表同步任务')} title="同步下方搜索区选定IP；未选IP时仅同步本人未归属素材池">同步到飞书</button><button onClick={()=>setModal(true)}><Plus size={15}/>手工新增素材</button></div>}>
       <div className="toolbar topic-toolbar"><div className="tabs">{[['all','全部'],['recommended','推荐'],['candidate','候选池'],['rising','起量'],['low_fan','低粉高赞'],['unknown_time','时间待核实'],['available','可用素材'],['adopted','已写稿'],['excluded','已排除']].map(([k,t])=><button key={k} className={tab===k?'active':''} onClick={()=>setTab(k)}>{t}</button>)}</div><div className="button-row"><select aria-label="素材来源" value={source} onChange={e=>setSource(e.target.value)}><option value="all">全部平台来源</option>{['抖音','小红书','视频号',...Array.from(new Set(rows.map(sourcePlatform))).filter(p=>!['抖音','小红书','视频号'].includes(p))].map(p=><option key={p} value={p}>{p}</option>)}</select><select aria-label="列表排序" value={sort} onChange={e=>setSort(e.target.value)}><option value="likes">按点赞排序</option><option value="multiplier">按样本倍数</option><option value="reference">按综合参考分</option><option value="date">按发布时间</option><option value="comments">按评论排序</option><option value="collected">按入库时间</option></select><div className="search-box"><Search size={15}/><input aria-label="搜索素材" placeholder="搜标题、文案或博主" value={q} onChange={e=>setQ(e.target.value)}/></div></div></div>
       {active&&<p className="muted topic-help">搜索任务正在执行，内容列表与评论入库数量会自动更新。</p>}
+      {processingTranscripts&&<p className="muted topic-help">视频逐字稿正在后台提取，点击「调用写手」查看单条进度。</p>}
       {shown.length?<div className="table-scroll"><table className="topics-table"><thead><tr><th>素材 / 来源博主</th><th>发布时间</th><th>互动数据</th><th>评论自动入库</th><th>爆款参考</th><th>操作</th></tr></thead><tbody>{shown.slice((page-1)*25,page*25).map(r=>{const a=authors.find(a=>a.id===r.author_id),d=r.discovery||{};return <tr key={r.id}>
         <td><div className="topic-material"><div className="topic-cover">{r.cover?<img src={r.cover} loading="lazy" referrerPolicy="no-referrer" alt="作品封面" onError={e=>{e.currentTarget.style.display='none'}}/>:<span>素材</span>}</div><div><strong className="table-title">{r.title}</strong><small><span className="badge">{sourcePlatform(r)}</span> <button className="text-button" onClick={()=>c.go('authors')}>{a?.title||r.author||'未记录作者'}</button> · 粉丝 {count(a?.followers)} · {r.duration!=null?`${r.duration}秒`:'时长未知'}</small><small>来源词：{r.keywords?.join('、')||r.keyword||(r.legacy_source?'保险行业历史存档':'手工录入')} · {c.ips.find(i=>i.id===r.ip_id)?.name||'未归属IP'}</small><div className="button-row">{r.source?.startsWith('https://')&&<a href={r.source} target="_blank" rel="noreferrer">看原内容 <ExternalLink size={12}/></a>}<Badge value={r.status}/></div></div></div></td>
         <td>{date(r.published_at)}<small>采集：{r.collected_at?fmt(r.collected_at):r.legacy_source?'历史存档（采集时间未知）':'手工记录'}</small></td>
         <td><strong>赞 {count(r.likes)}</strong><small>藏 {count(r.collects)} · 转 {count(r.shares)}</small><small>播放 {count(r.plays)}</small></td>
         <td><strong>平台 {count(r.comments_count)}</strong><small>已入库 {r.collected_comments||0}</small><small className={r.comments_status==='failed'?'error-text':'muted'} title={r.comments_error||''}>{commentLabel(r)}</small><button className="text-button" onClick={()=>c.go('leads')}>查看客户线索</button></td>
         <td><strong>{d.multiplier!=null?`样本倍数 ${d.multiplier.toFixed(1)} 倍`:r.author_sample_median_likes===0?'基线为0，倍数未知':'倍数未知 / 样本不足'}</strong><small>已采 {r.author_sample_count||0} 条有效样本 · 中位赞 {count(r.author_sample_median_likes)} · 分母 {count(d.denominator)}</small><small>{d.like_level||'点赞等级未知'} · 评赞比 {d.comment_ratio!=null?`${(d.comment_ratio*100).toFixed(1)}%（${d.comment_ratio_level}）`:'未知'}</small>{d.low_fan_hit&&<span className="badge">低粉高赞</span>}{d.rising&&<span className="badge">起量</span>}<small>{d.likes_delta!=null?`本轮涨赞 ${d.likes_delta} · 间隔 ${Math.round(d.observation_seconds/60)} 分钟`:'无两轮有效快照，涨赞未知'}</small>{d.reasons?.map((reason:string)=><small key={reason}>{reason}</small>)}{d.excluded_reason&&<small className="muted">{d.excluded_reason}</small>}<small>综合参考分 {d.reference_score??'未知'} · 规则 v{d.version||'—'}</small><span className={'badge '+(d.recommended?'good':'')}>{d.recommended?'推荐参考':'仅供研究'}</span></td>
-        <td><div className="topic-actions"><button className="text-button" onClick={()=>setWriting(r)}>调用写手</button><button className="text-button" onClick={()=>c.run(()=>patch(`/records/materials/${r.id}`,{status:r.status==='excluded'?'new':'excluded'}),'素材状态已更新')}>{r.status==='excluded'?'恢复':'不要'}</button><small>{r.feishu_synced_at?'已同步飞书':'未同步飞书'}</small></div></td>
+        <td><div className="topic-actions"><button className="text-button" onClick={()=>setWriting(r)}>调用写手</button><button className="text-button" onClick={()=>c.run(()=>patch(`/records/materials/${r.id}`,{status:r.status==='excluded'?'new':'excluded'}),'素材状态已更新')}>{r.status==='excluded'?'恢复':'不要'}</button>{transcriptLabel(r)&&<small className={r.transcript_status==='failed'?'error-text':'muted'}>{transcriptLabel(r)}</small>}<small>{r.feishu_synced_at?'已同步飞书':'未同步飞书'}</small></div></td>
       </tr>})}</tbody></table></div>:<Empty title="暂无符合条件的素材" body="在下方选择平台并搜索关键词，内容和评论会自动入库。"/>}
       {shown.length>25&&<div className="toolbar"><button disabled={page===1} onClick={()=>setPage(p=>p-1)}>上一页</button><span>第{page} / {Math.ceil(shown.length/25)}页</span><button disabled={page*25>=shown.length} onClick={()=>setPage(p=>p+1)}>下一页</button></div>}
       <details className="topic-criteria"><summary>爆款参考怎么算？</summary><DiscoveryRules version={c.version}/></details>
@@ -122,7 +145,7 @@ export default function Topics(c:Ctx & {preferredWriter?: WriterPreference | nul
           })}
           <label className="check-row"><input type="checkbox" checked={enrich} onChange={e=>setEnrich(e.target.checked)}/>补充抖音作者详情</label>
         </div>
-        <p className="muted topic-help">本次调用上界 <strong>{estimate}</strong> 次；今日已用 {service.today_calls??'—'} / {service.daily_budget??'—'} 次。{!invalidLimits.length&&`每平台最多入库 ${maxVideos} 条作品，每条自动读取 ${commentPages} 页一级评论。`}视频号含必要详情调用。预算不足或接口失败会显示部分完成。</p>
+        <p className="muted topic-help">本次调用上界 <strong>{estimate}</strong> 次；今日已用 {service.today_calls??'—'} / {service.daily_budget??'—'} 次。{!invalidLimits.length&&`每平台最多入库 ${maxVideos} 条作品，每条自动读取 ${commentPages} 页一级评论。`}视频号含必要详情调用。视频入库后自动转写，每条新视频最多另用 1 次 TikHub 调用，占用同一日预算。预算不足或接口失败会显示部分完成。</p>
         <p className="muted">作品入库后，按系统设置中的作品推荐规则统一计算。</p>
         <p className="muted">未选IP时进入本人未归属素材池，管理员与本团队团队长按权限可见。调用写手时再选目标IP。小红书支持图文和视频笔记；平台能力以TikHub实际返回为准。</p>
         {!service.configured&&<p className="muted">请管理员前往系统设置 → TikHub采集填写 API Key 并启用。{c.me.role==='admin'&&<button type="button" className="text-button" onClick={()=>c.go('settings')}>打开系统设置 <ArrowUpRight size={13}/></button>}</p>}
@@ -132,7 +155,7 @@ export default function Topics(c:Ctx & {preferredWriter?: WriterPreference | nul
       {runs.length?<div className="table-scroll"><table><thead><tr><th>任务 / 范围</th><th>状态</th><th>调用 / 处理</th><th>结果说明</th><th>时间</th></tr></thead><tbody>{runs.slice(0,20).map(r=><tr key={r.id}><td><strong>{r.task==='feishu_sync'?'飞书三表同步':r.options?.material_id?'作品评论补采':r.options?.keywords}</strong><small>{c.ips.find(i=>i.id===r.ip_id)?.name||'未归属IP'} · {(r.options?.platforms||['douyin']).map((p:string)=>PLATFORMS.find(([id])=>id===p)?.[1]||p).join('、')}</small></td><td><Badge value={r.status}/>{['failed','partial'].includes(r.status)&&<button className="text-button" onClick={()=>c.run(()=>post('/collection/retry/'+r.id,{}),'已提交重试任务')}>手动重试</button>}</td><td>{r.calls} 次调用<small>{r.task==='collection'?`${r.materials||0} 作品 / ${r.authors||0} 博主 / ${r.comments||0} 评论处理`:`已同步 ${r.processed||0} 条`}</small></td><td><span className={r.error?'error-text':'muted'}>{r.error||r.progress||'等待后台执行'}</span>{r.conflict&&<details><summary>查看字段差异</summary><pre className="sync-conflict">{JSON.stringify(r.conflict,null,2)}</pre></details>}{r.sync_run_id&&<small>另有飞书同步任务</small>}</td><td>{fmt(r.created_at)}</td></tr>)}</tbody></table></div>:<Empty title="暂无采集记录" body="提交后显示搜索和评论入库进度、调用次数与错误。"/>}
     </Card>
     <Notice>评论自动按平台ID去重进入客户线索，标为研究评论；意向需人工核实。作品描述不等于语音逐字稿。飞书仅在管理员配置启用后同步；未归属IP同步仅包含本人素材池。</Notice>
-    {writing&&<MaterialWriterDialog c={c} material={writing} preferredWriter={c.preferredWriter} onClose={()=>setWriting(null)}/>}
+    {writing&&<MaterialWriterDialog c={c} material={writing} preferredWriter={c.preferredWriter} onClose={()=>{setWriting(null);setPulse(value=>value+1)}}/>}
     {modal&&<Modal title="新增素材" onClose={()=>setModal(false)}><form onSubmit={e=>{e.preventDefault();const data=Object.fromEntries(new FormData(e.currentTarget));c.run(async()=>{await post('/records/materials',{...data,ip_id:target||null});setModal(false)},'素材已保存')}}><Field label="归属IP（可选）">{ipSelect(target,setTarget)}</Field><Field label="标题"><input name="title" required/></Field><Field label="正文 / 原话"><textarea name="body" rows={5}/></Field><Field label="作者"><input name="author"/></Field><Field label="来源平台"><select name="platform"><option>抖音</option><option>小红书</option><option>视频号</option><option>其他</option></select></Field><Field label="来源链接"><input name="source"/></Field><button className="primary">保存素材</button></form></Modal>}
   </>;
 }

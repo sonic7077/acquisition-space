@@ -350,6 +350,20 @@ def test_overlap_counts_every_occurrence_without_double_count():
     assert sum(x['length'] for x in report['snippets']) == 22
 
 
+def test_overlap_reports_full_draft_sentences_ranked_by_matching_characters():
+    from backend.app.writing import checks
+
+    long_sentence = '先' * 250 + '春夏秋冬、东西南北前后。'
+    body = '甲乙丙丁。戊己庚辛。' + long_sentence
+    report = checks({'body': body, 'reference': '甲乙丙丁戊己庚辛。春夏秋冬东西南北前后'})[-1]
+    assert report['matched'] == 18
+    assert report['matched_sentences'] == [
+        {'text': long_sentence, 'matched': 10, 'fragments': [{'text': '春夏秋冬东西南北前后', 'length': 10}]},
+        {'text': '甲乙丙丁。', 'matched': 4, 'fragments': [{'text': '甲乙丙丁', 'length': 4}]},
+        {'text': '戊己庚辛。', 'matched': 4, 'fragments': [{'text': '戊己庚辛', 'length': 4}]},
+    ]
+
+
 def test_oral_review_rules_preserve_configured_limit_and_flag_phrases():
     from backend.app.writing import checks
     payload = {
@@ -445,6 +459,7 @@ def test_review_does_not_expose_reference_from_another_members_material(env):
     assert 'reference' not in visible and visible['reference_restricted']
     report = visible['checks'][-1]
     assert report['state'] == 'restricted' and report['snippets'] == [] and report['ratio'] is None
+    assert not report.get('matched_sentences')
     edits = {'version': 1, 'reference': '伪造来源'}
     assert member.post('/api/drafts/checks', json={**edits, 'draft_id': draft_id}).status_code == 403
     assert member.patch(endpoint, json=edits).status_code == 403

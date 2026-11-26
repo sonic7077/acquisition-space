@@ -207,11 +207,11 @@ def register(app, get_db, current, audit):
             require_ip(db, user, data.ip_id)
         run={'ip_id':data.ip_id,'owner_id':user.id,'options':{'all_scopes':data.all_scopes}}
         counts={name:len(sync_rows(db,kind,run)) for name,kind in KINDS.items()}
-        unmapped={kind:len(sync_rows(db,kind,run)) for kind in ('knowledge','writers','drafts','needs')}
+        unmapped={kind:len(sync_rows(db,kind,run)) for kind in ('knowledge','writers','drafts')}
         from .feishu_library import counts as library_counts
         library=library_counts(db,run) if data.include_library else None
         return {'counts':counts,'unmapped_counts':unmapped,'library_counts':library,
-                'notice':('全部材料同步包含知识库、8个系统写手、专属写手、稿件和IP账号；需求库暂未映射。' if data.include_library else '三表同步包括博主、作品、平台原始评论。其他材料可由管理员使用全部材料同步。')}
+                'notice':('全部材料同步包含知识库、8个系统写手、专属写手、稿件和IP账号。' if data.include_library else '三表同步包括博主、作品、平台原始评论。其他材料可由管理员使用全部材料同步。')}
 
     @app.post('/api/integrations/feishu/sync')
     def sync(data: SyncInput, user=Depends(current), db=Depends(get_db)):

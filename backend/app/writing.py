@@ -68,8 +68,8 @@ def transcript_available(payload):
     return not (payload.get('material_id') and not payload.get('generation_job'))
 
 
-def add_sentence_context(snippets, body):
-    """Match intervals are in normalized text. Map their surrounding sentences to the draft."""
+def add_sentence_context(snippets, body, normalized_body):
+    """Map normalized match intervals to the draft's original sentences."""
     sentences, ends = [], []
     position = 0
     for sentence in SENTENCE_BOUNDARY.split(body):
@@ -80,11 +80,23 @@ def add_sentence_context(snippets, body):
             ends.append(position)
         elif sentences:
             sentences[-1] += sentence
+    matched_sentences = {}
     for snippet in snippets:
-        first = bisect_right(ends, snippet.pop('start'))
-        last = bisect_right(ends, snippet.pop('end') - 1)
+        start = snippet.pop('start')
+        end = snippet.pop('end')
+        first = bisect_right(ends, start)
+        last = bisect_right(ends, end - 1)
         if last - first <= 2 and sum(len(text) for text in sentences[first:last + 1]) <= 240:
             snippet['sentence'] = ' '.join(text.strip() for text in sentences[first:last + 1])
+        for index in range(first, last + 1):
+            sentence_start = ends[index - 1] if index else 0
+            fragment = normalized_body[max(start, sentence_start):min(end, ends[index])]
+            result = matched_sentences.setdefault(index, {
+                'text': sentences[index].strip(), 'matched': 0, 'fragments': [],
+            })
+            result['fragments'].append({'text': fragment, 'length': len(fragment)})
+            result['matched'] += len(fragment)
+    return sorted(matched_sentences.values(), key=lambda sentence: -sentence['matched'])
 
 
 def overlap_check(payload, normalized_body, settings):
@@ -117,10 +129,10 @@ def overlap_check(payload, normalized_body, settings):
             snippets.append({'text': a[start:pos], 'length': pos - start, 'start': start, 'end': pos})
             start = None
     ratio = len(covered) / len(a)
-    if snippets:
-        add_sentence_context(snippets, payload['body'])
+    matched_sentences = add_sentence_context(snippets, payload['body'], normalized_body) if snippets else []
     return check('overlap', '来源重合检查', ratio <= threshold, state='compared',
-                 ratio=ratio, snippets=snippets, matched=len(covered), total=len(a), **context)
+                 ratio=ratio, snippets=snippets, matched_sentences=matched_sentences,
+                 matched=len(covered), total=len(a), **context)
 
 
 def checks(payload, settings=None):

@@ -4,12 +4,12 @@ import type { Row } from '../api';
 import { Badge, Empty, fmt } from '../components/ui';
 import { useRows, type Ctx } from '../context';
 import { groupLeads } from './leadGroups';
-export default function LeadTree({c,rows,q,type,intent,contentType="all",onEdit}:{c:Ctx;rows:Row[];q:string;type:string;intent:string;contentType?:string;onEdit:(r:Row)=>void}) {
+export default function LeadTree({c,rows,q,type,intent,contentType="all",onEdit,onTopic}:{c:Ctx;rows:Row[];q:string;type:string;intent:string;contentType?:string;onEdit:(r:Row)=>void;onTopic:(r:Row)=>void}) {
   const [sort,setSort]=useState('collected'),[effective,setEffective]=useState(false);
   const authors=useRows('/records/authors',c.version),materials=useRows('/records/materials',c.version);
   const [opened,setOpened]=useState<Record<string,boolean>>({}),[limits,setLimits]=useState<Record<string,number>>({}),[mode,setMode]=useState<'default'|'all'|'none'>('default');
-  useEffect(()=>{setOpened({});setMode('default');},[q,type,intent,contentType,c.ip]);
-  const selected=rows.filter(r=>!effective||['问价格','问方案','要资料'].includes(r.intent)&&!['反对','共鸣'].includes(r.content_type));
+  useEffect(()=>{setOpened({});setMode('default');},[q,type,intent,contentType,c.ip,effective]);
+  const selected=rows.filter(r=>!effective||r.effective_demand===true);
   const ordered=[...selected].sort((a,b)=>sort==='likes'?(b.likes??-1)-(a.likes??-1):new Date(b.collected_at||b.created_at||0).getTime()-new Date(a.collected_at||a.created_at||0).getTime());
   const groups=groupLeads(ordered,authors,materials,q,type,intent,contentType);
   const visible=groups.flatMap(g=>g.works.flatMap(w=>w.rows));
@@ -20,7 +20,7 @@ export default function LeadTree({c,rows,q,type,intent,contentType="all",onEdit}
   function all(value:'all'|'none'){setMode(value);setOpened({});}
   const ipName=(id:string|null)=>c.ips.find(i=>i.id===id)?.name||'未归属IP';
   return <div className="lead-tree-area">
-    <div className="toolbar"><label>评论排序 <select aria-label="评论排序" value={sort} onChange={e=>setSort(e.target.value)}><option value="collected">按采集时间</option><option value="likes">按点赞数</option></select></label><label className="check-row"><input type="checkbox" checked={effective} onChange={e=>setEffective(e.target.checked)}/>仅看有效需求</label><small>按当前标签筛选证据，不改变研究评论的客户状态。</small></div>
+    <div className="toolbar"><label>评论排序 <select aria-label="评论排序" value={sort} onChange={e=>setSort(e.target.value)}><option value="collected">按采集时间</option><option value="likes">按点赞数</option></select></label><label className="check-row"><input type="checkbox" checked={effective} onChange={e=>setEffective(e.target.checked)}/>仅看有效需求</label></div>
     <div className="comment-distribution"><p><strong>类型分布</strong>：{dist('content_type')||'暂无'}</p><p><strong>意向分布</strong>：{dist('intent')||'暂无'}</p></div>
     <div className="lead-tree-toolbar"><span>匹配 {groups.length} 个来源分组 · {groups.reduce((n,g)=>n+g.works.length,0)} 个作品分组 · {groups.reduce((n,g)=>n+g.works.reduce((s,w)=>s+w.rows.length,0),0)} 条记录</span><div className="button-row"><button onClick={()=>all('all')}>展开全部</button><button onClick={()=>all('none')}>收起全部</button></div></div>
     {groups.length?<div className="lead-tree" aria-label="按来源博主和作品分组的客户线索">{groups.map(g=>{
@@ -30,7 +30,16 @@ export default function LeadTree({c,rows,q,type,intent,contentType="all",onEdit}
         <div className="lead-works">{g.works.map(w=>{const key=g.key+':work:'+w.key,manual=w.key==='unlinked';return <details className="lead-work" key={key} open={open(key,false,manual)} onToggle={e=>{if(e.currentTarget.open!==open(key,false,manual))toggle(key,e.currentTarget.open)}}>
           <summary><ChevronRight className="lead-chevron" size={15}/><FileText size={16}/><div className="lead-node-title"><strong>来自作品：{w.title}</strong>{w.material?.published_at&&<small>发布时间：{new Date(w.material.published_at*1000).toLocaleDateString('zh-CN')}</small>}</div><span className="lead-node-count">{w.rows.length} 条记录</span></summary>
           <div className="lead-entries">{w.rows.slice(0,limits[key]||50).map(r=><article className="lead-entry" data-lead-id={r.id} key={r.id}>
-            <div className="lead-entry-head"><strong>{r.title}</strong><span className={'badge '+(r.contactable===false?'':'good')}>{r.contactable===false?'研究评论':'人工登记/已标记'}</span><Badge value={r.content_type||'待核实'}/><Badge value={r.intent||'待核实'}/>{r.manual_labels?.length>0&&<span className="badge">人工修正</span>}<button className="text-button" onClick={()=>onEdit(r)}>查看 / 编辑</button></div>
+            <div className="lead-entry-head">
+              <strong>{r.title}</strong><span className="badge">{r.contactable===false?'研究评论':'人工登记/已标记'}</span>
+              <Badge value={r.content_type||'待核实'}/><Badge value={r.intent||'待核实'}/>
+              {r.effective_demand&&<span className="badge good">有效需求</span>}
+              {r.manual_labels?.length>0&&<span className="badge">人工修正</span>}
+              <div className="lead-entry-actions">
+                <button className="text-button" onClick={()=>onEdit(r)}>查看 / 编辑</button>
+                {r.effective_demand&&c.ips.length>0&&<button className="text-button" onClick={()=>onTopic(r)}>转为选题</button>}
+              </div>
+            </div>
             <p className="lead-original">{r.body||'未记录原话'}</p>
             <div className="lead-entry-meta"><span>跟进阶段：<Badge value={r.status}/></span><span>负责人：{r.owner||'未分配'}</span><span>下次跟进：{r.next_followup||'未安排'}</span></div>
             <small>{r.analysis_basis||r.intent_basis||'标签待核实'} · {r.analysis_version||'历史记录'}</small>

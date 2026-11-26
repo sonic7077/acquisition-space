@@ -1,5 +1,31 @@
 import { test, expect } from "@playwright/test";
 
+test("拍摄上传在选择当前批准稿件前说明原因并禁用文件选择", async ({ page, request }) => {
+  await request.post("/api/auth/login", { data: { username: "admin", password: "admin" } });
+  const team = await (await request.post("/api/teams", { data: { name: "上传验证组" } })).json();
+  const ip = await (await request.post("/api/ips", { data: { name: "上传验证IP", team_id: team.id } })).json();
+  const draft = await (await request.post("/api/drafts", { data: {
+    ip_id: ip.id, title: "上传验证稿", body: "先确认需求，再选择合适的服务。", skill: "original-video-writer", fact_status: "none",
+  } })).json();
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "进入工作台" }).click();
+  await page.getByLabel("筛选IP", { exact: true }).selectOption(ip.id);
+  await page.getByRole("button", { name: "拍摄上传", exact: true }).click();
+  const upload = page.getByRole("button", { name: /选择视频与封面/ });
+  await expect(upload).toBeDisabled();
+  await page.getByRole("button", { name: "前往审稿", exact: true }).click();
+  await expect(page.getByRole("heading", { name: draft.title, exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "批准通过", exact: true }).click();
+  await expect(page.getByText("当前版本已批准", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "拍摄上传", exact: true }).click();
+  await expect(upload).toBeDisabled();
+  await page.getByLabel("明确关联稿件").selectOption(draft.id);
+  await expect(upload).toBeEnabled();
+  await page.getByLabel("筛选IP", { exact: true }).selectOption("");
+  await expect(upload).toBeDisabled();
+});
+
 test("管理员完成知识上传、写手、审稿、排期和模型设置", async ({
   page,
   request,

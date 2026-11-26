@@ -539,9 +539,16 @@ def create_app(data_dir=None):
             materials, authors = discovery_records(visible(db, user, 'materials'), visible(db, user, 'authors'), rules_for(setting_data(db)))
             if kind == 'authors':
                 return authors
-            from .integrations.transcript import video_identity
+            from .integrations.transcript import progress_view, supported_identity, transcript_key, transcript_states
+            states = transcript_states(db)
             for material in materials:
-                material['transcript_supported'] = bool(video_identity(material))
+                identity = supported_identity(material)
+                material['transcript_supported'] = bool(identity)
+                if identity:
+                    state = progress_view(states.get(transcript_key(material['id'], identity), {}))
+                    material.update(transcript_status=state['status'], transcript_progress=state['progress'])
+                    if 'feishu' in state:
+                        material['transcript_feishu_status'] = state['feishu']['status']
             return materials
         return [demand_view(db, user, r) if kind == 'needs' else ({**as_record(r), **labels(r.payload)} if kind == 'leads' else as_record(r)) for r in visible(db, user, kind)]
 
@@ -706,7 +713,8 @@ def create_app(data_dir=None):
         if snapshot:
             row.payload = {**row.payload, 'need_id': data['need_id'], 'demand_snapshot': snapshot}
             need = db.get(Record, data['need_id'])
-            need.payload = {**need.payload, 'status': 'writing'}
+            if need.kind == 'needs':
+                need.payload = {**need.payload, 'status': 'writing'}
         audit(db, user, '创建稿件', row.id)
         return public_record(db, user, row)
 
@@ -957,11 +965,14 @@ def create_app(data_dir=None):
         for r in sorted(scoped('metrics'), key=lambda x: x.payload['date']):
             latest[(r.ip_id, r.payload['platform'], r.payload['work_id'])] = r.payload
         rows = list(latest.values())
+        leads = scoped('leads')
+        effective_count = sum(labels(r.payload)['effective_demand'] for r in leads)
+        contactable_count = sum(r.payload.get('contactable', True) is not False for r in leads)
         return {'works': len(rows), 'views': sum(r.get('views') or 0 for r in rows), 'leads': sum(r.get('leads') or 0 for r in rows), 'missing_views': sum(r.get('views') is None for r in rows), 'sections': [
             {'title': '本期概况', 'body': f'已导入{len(rows)}条独立平台作品，使用每条作品最后一个累计快照；不能当作本周新增。'},
             {'title': '内容表现', 'body': '按平台分开对比作品；缺失指标不替代为零。'},
-            {'title': '客户需求', 'body': f'需求记录{len(scoped("needs"))}条，结合客户原话人工判断。'},
-            {'title': '获客与转化', 'body': f'客户线索{sum(r.payload.get("contactable", True) is not False for r in scoped("leads"))}条；平台指标与实际客户身份未核对时，不计算转化率。'},
+            {'title': '客户需求', 'body': f'客户线索中有 {effective_count} 条有效需求，可查看原话和来源。'},
+            {'title': '获客与转化', 'body': f'人工登记或已标记线索 {contactable_count} 条；平台指标与实际客户身份未核对时，不计算转化率。'},
             {'title': '下期动作', 'body': '选一个主要变量做内容实验；写手规则需独立证据与人工采纳。'}]}
 
     @app.get('/api/dashboard')

@@ -16,7 +16,6 @@ import {
   ChevronRight,
   RefreshCw,
   PanelLeftClose,
-  FileText,
 } from "lucide-react";
 import { api, post, type Row } from "./api";
 
@@ -28,8 +27,7 @@ import Writers from "./pages/Writers";
 import { type WriterPreference } from "./pages/MaterialWriterDialog";
 import SettingsPage from "./pages/SettingsPage";
 import UsersPage from "./pages/UsersPage";
-import Records from "./pages/Records";
-import Demands from "./pages/Demands";
+import Leads from "./pages/Leads";
 import Topics from "./pages/Topics";
 import Drafts from "./pages/Drafts";
 import Assets from "./pages/Assets";
@@ -59,7 +57,6 @@ const GROUPS = [
   {
     name: "内容基础",
     items: [
-      ["needs", "需求库", FileText],
       ["knowledge", "知识库", BookOpen],
       ["writers", "IP与写手", BrainCircuit],
       ["help", "使用说明", BookOpen],
@@ -75,10 +72,15 @@ const GROUPS = [
 ];
 const ALL = GROUPS.flatMap((g) => g.items);
 const getError = (e: unknown) => (e instanceof Error ? e.message : "操作失败");
+function currentPage() {
+  const hash = location.hash.slice(1);
+  if (hash === "needs") return "leads";
+  return ALL.some(([id]) => id === hash) ? hash : "dashboard";
+}
 export default function App() {
   const [me, setMe] = useState<Row | null>(null),
-    [ready, setReady] = useState(false);
-  const [page, setPage] = useState(location.hash.slice(1) || "dashboard"),
+    [ready, setReady] = useState(false),
+    [page, setPage] = useState(currentPage),
     [ips, setIps] = useState<Row[]>([]),
     [ip, setIp] = useState(""),
     [preferredWriter, setPreferredWriter] = useState<WriterPreference | null>(null),
@@ -117,7 +119,11 @@ export default function App() {
         .catch((e) => setError(getError(e)));
   }, [me, version]);
   useEffect(() => {
-    const cb = () => setPage(location.hash.slice(1) || "dashboard");
+    const cb = () => {
+      if (location.hash === "#needs") history.replaceState(null, "", "#leads");
+      setPage(currentPage());
+    };
+    cb();
     window.addEventListener("hashchange", cb);
     return () => window.removeEventListener("hashchange", cb);
   }, []);
@@ -259,6 +265,7 @@ export default function App() {
                 {(
                   {
                     dashboard: "把灵感变成内容，把内容变成客户。",
+                    leads: "按来源查看评论和咨询，从有效需求直接创建选题。",
                     knowledge: "让已有知识成为写手的可靠依据。",
                     settings: "统一管理模型、密钥与外部服务。",
                     writers: "结合写手资料、基础 Skill 和知识库，生成可用于素材改写的专属 Skill。",
@@ -295,8 +302,8 @@ export default function App() {
             <Authors {...ctx} />
           ) : page === "help" ? (
             <Help {...ctx} />
-          ) : page === "needs" ? (
-            <Demands {...ctx} />
+          ) : page === "leads" ? (
+            <Leads {...ctx} />
           ) : page === "knowledge" ? (
             <Knowledge {...ctx} />
           ) : page === "writers" ? (
@@ -312,13 +319,13 @@ export default function App() {
           ) : page === "drafts" ? (
             <Drafts key={selectedDraftId} {...ctx} initialDraftId={selectedDraftId} />
           ) : page === "assets" ? (
-            <Assets {...ctx} />
+            <Assets key={ip} {...ctx} />
           ) : page === "schedules" ? (
             <Schedules {...ctx} />
           ) : page === "reports" ? (
             <Reports {...ctx} />
           ) : (
-            <Records key={page} {...ctx} kind={page} />
+            <Dashboard {...ctx} />
           )}
           <footer>
             获客空间 · 让知识持续转化为内容价值 <span>本地工作空间 / v0.1</span>
