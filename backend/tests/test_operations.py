@@ -464,7 +464,13 @@ def test_daily_limit_unknown_wechat_draft_and_worker(tmp_path):
             db.commit()
 
         # WeChat draft-only flow
-        wx_res = member.post(f"/api/ops/schedules/{sched['id']}/dispatch", json={"account_id": "wx_acc_1", "mode": "publish"}).json()
+        options = {"account_id": "wx_acc_1", "mode": "publish"}
+        assert member.post(f"/api/ops/schedules/{sched['id']}/dispatch", json=options).status_code == 422
+        wx_schedule = admin.post("/api/schedules", json={
+            "draft_id": draft["id"], "platform": "公众号", "account": "企业公众号",
+            "planned_at": datetime.now(timezone.utc).isoformat(),
+        }).json()
+        wx_res = member.post(f"/api/ops/schedules/{wx_schedule['id']}/dispatch", json=options).json()
         assert wx_res["state"] == "DRAFT_PUSHED"
         assert member.post(f"/api/ops/publish-tasks/{wx_res['id']}/confirm-published", json={"evidence_url": "bad"}).status_code == 422
         wx_pub = member.post(f"/api/ops/publish-tasks/{wx_res['id']}/confirm-published", json={"evidence_url": "https://mp.weixin.qq.com/s/demo"}).json()

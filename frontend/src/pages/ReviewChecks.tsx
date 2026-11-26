@@ -50,7 +50,8 @@ function OverlapReport({ check, live }: { check: ReviewCheck; live?: boolean }) 
         )}
       </div>
       <p className="muted">
-        正文与对标逐字稿比较，去掉空白和标点后，连续 {check.min_match} 字及以上相同的正文位置只计一次。
+        去掉空白和标点后，连续 {check.min_match} 字及以上相同的正文位置只计一次。
+        重合度 = 命中字数 ÷ 处理后的正文字数，等于上限可以通过。
         {live && "编辑正文或对标逐字稿时实时更新。"}
       </p>
       {summary ? <>
@@ -88,8 +89,8 @@ export function ReviewChecks({ checks, onReviewFacts, live }: {
   if (!checks?.length) return null;
   const overlap = checks.find(check => check.id === "overlap");
   const rules = checks.filter(check => check.id !== "overlap");
-  const blocked = rules.some(check => !check.passed && check.blocking);
-  const hasAdvisory = rules.some(check => !check.passed && !check.blocking);
+  const blocked = checks.some(check => !check.passed && check.blocking);
+  const hasAdvisory = checks.some(check => !check.passed && !check.blocking);
   return (
     <div className="checks review-checks">
       <section aria-label="规则体检">
@@ -112,6 +113,8 @@ export function ReviewChecks({ checks, onReviewFacts, live }: {
                   <small>待核实。核对正文中的数据、政策、产品条款或案例，确认事实状态并保存新版本后再批准。</small>
                   {onReviewFacts && <button type="button" className="review-fact-action" onClick={onReviewFacts}>去核验事实</button>}
                 </>}
+                {check.id === "reference_title" && !check.passed && <small>可以借鉴标题公式，请改用自己的标题。</small>}
+                {check.id === "reference_opening" && !check.passed && <small>可以借鉴开场结构，请重新写正文首句。</small>}
                 {check.id === "resource_hook" && !check.passed && <small>如有可提供的真实资料，可在结尾说明资料用途。</small>}
               </div>
               <strong>{status}</strong>

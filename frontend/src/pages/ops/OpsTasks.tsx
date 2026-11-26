@@ -4,6 +4,15 @@ import { api, post, type Row } from "../../api";
 import { Badge, Card, Empty, Field, Modal, Notice, fmt } from "../../components/ui";
 import { type Ctx, filterIp, useRows } from "../../context";
 
+const PLATFORM_CODES: Record<string, string> = {
+  抖音: "Douyin",
+  小红书: "XiaoHongShu",
+  视频号: "Channels",
+  哔哩哔哩: "Bili",
+  B站: "Bili",
+  公众号: "GongZhongHao",
+};
+
 export default function OpsTasks(c: Ctx & { initialScheduleId?: string }) {
   const schedules = filterIp(useRows("/schedules", c.version), c.ip),
     [tasks, setTasks] = useState<Row[]>([]),
@@ -76,6 +85,11 @@ export default function OpsTasks(c: Ctx & { initialScheduleId?: string }) {
   }
 
   const readySchedules = schedules.filter((s) => !["cancelled", "needs_review"].includes(s.status));
+  const selectedSchedule = readySchedules.find((s) => s.id === selectedScheduleId);
+  const platformAccounts = selectedSchedule ? accounts.filter(
+    (a) => a.platform === PLATFORM_CODES[selectedSchedule.platform] &&
+      (!a.ip_id || !selectedSchedule.ip_id || a.ip_id === selectedSchedule.ip_id),
+  ) : [];
 
   return (
     <>
@@ -228,9 +242,11 @@ export default function OpsTasks(c: Ctx & { initialScheduleId?: string }) {
               </select>
             </Field>
             <Field label="目标平台账号">
-              <select name="account_id" required>
-                <option value="">请选择已绑定账号</option>
-                {accounts.map((a) => (
+              <select key={selectedScheduleId} name="account_id" required disabled={!platformAccounts.length}>
+                <option value="">{selectedSchedule && !platformAccounts.length
+                  ? `暂无可用的${selectedSchedule.platform}账号`
+                  : "请选择平台账号"}</option>
+                {platformAccounts.map((a) => (
                   <option key={a.id} value={a.id}>
                     {a.platform_name} · {a.nickname} ({a.login_status})
                   </option>
@@ -250,7 +266,7 @@ export default function OpsTasks(c: Ctx & { initialScheduleId?: string }) {
               </select>
             </Field>
             <Notice>系统会自动校验稿件批准状态、视频 SHA-256 哈希与每账号每日最多 3 条上限。</Notice>
-            <button className="primary">提交执行</button>
+            <button className="primary" disabled={!platformAccounts.length}>提交执行</button>
           </form>
         </Modal>
       )}

@@ -17,7 +17,7 @@ from sqlalchemy import select, func
 from .db import User, LoginSession, Record, database, now, uid, as_record, business_today
 from .security import password_hash, password_ok, public_user, admin_only, approver, active_ip, can_ip, require_ip, SecretStore, ROLES, can_record, require_record
 from .knowledge import expand_uploads, MAX_FILE, shared_documents, template_text, verified_document
-from .writing import SKILLS, build_context, checks, transcript_available
+from .writing import SKILLS, build_context, draft_checks, transcript_available
 from .demand_analysis import labels, patch_labels, demand_view, demand_snapshot, attach_demand, public_record
 from .discovery import DEFAULT_RULES, rules_for, validate_rules, author_patch, discovery_records
 from .validation import record_input, text_fields
@@ -26,6 +26,8 @@ from .knowledge_categories import TREE, flatten, leaf, migrate as migrate_knowle
 from .integrations.feishu_target import default_url as default_feishu_url
 
 KINDS = {'materials', 'authors', 'needs', 'leads', 'metrics', 'rules'}
+WECHAT_PLATFORMS = ('视频号', '公众号')
+WECHAT_TOUCHPOINTS = ('视频号', '公众号', '朋友圈', '图文贴', '微信群', '私域资料')
 
 
 class Credentials(BaseModel):
@@ -669,18 +671,17 @@ def create_app(data_dir=None):
         material = db.get(Record, material_id)
         return material is not None and material.kind == 'materials' and can_record(db, user, material)
 
-    def review_checks(payload, config, reference_restricted):
-        if not reference_restricted:
-            return checks(payload, config)
-        result = checks({**payload, 'reference': ''}, config)
-        result[-1] = {**result[-1], 'state': 'restricted'}
+    def review_checks(db, payload, config, reference_restricted):
+        result = draft_checks(db, payload, config, include_reference=not reference_restricted)
+        if reference_restricted:
+            result[-1] = {**result[-1], 'state': 'restricted'}
         return result
 
     def draft_review(db, user, row, config):
         output = public_record(db, user, row)
         if not transcript_available(row.payload):
             output.pop('reference', None)
-        output['checks'] = review_checks(row.payload, config, output.get('reference_restricted'))
+        output['checks'] = review_checks(db, row.payload, config, output.get('reference_restricted'))
         return output
 
     @app.post('/api/drafts/checks')
@@ -703,7 +704,7 @@ def create_app(data_dir=None):
                 if restricted:
                     raise HTTPException(403, '没有对标素材的访问权限')
                 edits['transcript_confirmed'] = bool(edits['reference'].strip())
-            return {'checks': review_checks({**payload, **edits}, setting_data(db).get('rules', {}), restricted)}
+            return {'checks': review_checks(db, {**payload, **edits}, setting_data(db).get('rules', {}), restricted)}
 
     @app.post('/api/drafts')
     def create_draft(data: dict, user=Depends(current), db=Depends(get_db)):
@@ -786,7 +787,7 @@ def create_app(data_dir=None):
             source = row_for(db, user, source_id, 'knowledge')
             if not verified_document(source):
                 raise HTTPException(409, '引用知识未核验或已过期，请复核')
-        results = checks(row.payload, setting_data(db).get('rules', {}))
+        results = draft_checks(db, row.payload, setting_data(db).get('rules', {}))
         if any(not c['passed'] and c['blocking'] for c in results):
             raise HTTPException(409, '稿件存在阻塞检查项，请先修正或核实事实')
         row.payload = {**row.payload, 'approved_version': row.payload['version'], 'status': 'approved', 'approved_by': user.id, 'approved_at': now()}
@@ -838,7 +839,7 @@ def create_app(data_dir=None):
         p = draft.payload
         if p.get('approved_version') != p['version'] or not p.get('approved_version'):
             raise HTTPException(409, '当前稿件批准已经失效')
-        if any(not result['passed'] and result['blocking'] for result in checks(p, setting_data(db).get('rules', {}))):
+        if any(not result['passed'] and result['blocking'] for result in draft_checks(db, p, setting_data(db).get('rules', {}))):
             raise HTTPException(409, '稿件不再满足当前审稿规则，请重新检查')
         for source_id in set(p.get('source_ids', [])) | {x['id'] for x in p.get('sources', [])}:
             source = row_for(db, user, source_id, 'knowledge')
@@ -871,7 +872,15 @@ def create_app(data_dir=None):
             ep = existing.payload
             if ep['draft_id'] == draft.id and ep['version'] == p['version'] and ep['platform'] == data['platform'] and ep['account'] == data['account'] and ep['status'] not in ('cancelled', 'needs_review'):
                 return as_record(existing)
-        row = Record(kind='schedules', ip_id=draft.ip_id, owner_id=user.id, payload={'draft_id': draft.id, 'title': p['title'], 'version': p['version'], 'platform': data['platform'], 'account': data['account'], 'planned_at': planned.isoformat(), 'status': 'planned', 'asset_id': media[0].id, 'snapshot': {'body': p['body'], 'asset_hash': media[0].payload['hash']}, 'touchpoints': {k: 'unprepared' for k in ('视频号', '公众号', '朋友圈', '图文贴', '微信群', '私域资料')}})
+        platform = data['platform']
+        payload = {
+            'draft_id': draft.id, 'title': p['title'], 'version': p['version'], 'platform': platform,
+            'account': data['account'], 'planned_at': planned.isoformat(), 'status': 'planned',
+            'asset_id': media[0].id, 'snapshot': {'body': p['body'], 'asset_hash': media[0].payload['hash']},
+        }
+        if platform in WECHAT_PLATFORMS:
+            payload['touchpoints'] = dict.fromkeys(WECHAT_TOUCHPOINTS, 'unprepared')
+        row = Record(kind='schedules', ip_id=draft.ip_id, owner_id=user.id, payload=payload)
         db.add(row)
         db.flush()
         audit(db, user, '创建发布排期', row.id)
@@ -902,6 +911,8 @@ def create_app(data_dir=None):
     @app.patch('/api/schedules/{key}/touchpoints')
     def touchpoints(key: str, data: dict, user=Depends(current), db=Depends(get_db)):
         row = row_for(db, user, key, 'schedules')
+        if row.payload.get('platform') not in WECHAT_PLATFORMS:
+            raise HTTPException(422, '只有视频号和公众号排期可以管理微信生态触点')
         channel = data.get('channel')
         state = data.get('status')
         if channel not in row.payload['touchpoints'] or state not in ('unprepared', 'producing', 'review', 'dependency', 'manual', 'published', 'skipped'):

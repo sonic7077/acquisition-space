@@ -4,6 +4,7 @@ import json
 import re
 import unicodedata
 from .knowledge import search_documents
+from .db import Record
 
 ROOT = Path(__file__).resolve().parents[2]
 SKILLS = {
@@ -135,7 +136,11 @@ def overlap_check(payload, normalized_body, settings):
                  matched=len(covered), total=len(a), **context)
 
 
-def checks(payload, settings=None):
+def first_sentence(text):
+    return next((sentence for part in SENTENCE_BOUNDARY.split(text) if (sentence := normalize(part))), '')
+
+
+def checks(payload, settings=None, *, reference_title=''):
     text, skill = payload.get('body', ''), payload.get('skill')
     title_count = len(payload.get('title', '').strip())
     title_maximum = 30 if skill in ('gzh-writer', 'tietu-writer') else 16
@@ -158,8 +163,28 @@ def checks(payload, settings=None):
         ])
     if skill in ('customer-needs-miner', 'ip-writer-skill-builder', 'writer-self-evolve'):
         result.append(check('analysis', '辅助分析结果不能作为发表稿件批准', False))
+    if skill == 'viral-rewrite-writer':
+        original_title = normalize(reference_title)
+        if original_title:
+            result.append(check('reference_title', '标题与对标作品标题不同',
+                                normalize(payload.get('title', '')) != original_title))
+        reference = payload.get('reference', '') if transcript_available(payload) else ''
+        opening = first_sentence(reference)
+        if opening:
+            result.append(check('reference_opening', '首句与对标逐字稿首句不同', first_sentence(text) != opening))
     result.append(overlap_check(payload, normalized_body, settings or {}))
     return result
+
+
+def draft_checks(db, payload, settings, *, include_reference=True):
+    if not include_reference:
+        return checks({**payload, 'reference': ''}, settings)
+    reference_title = ''
+    if payload.get('skill') == 'viral-rewrite-writer' and payload.get('material_id'):
+        material = db.get(Record, payload['material_id'])
+        if material and material.kind == 'materials':
+            reference_title = material.payload.get('title') or ''
+    return checks(payload, settings, reference_title=reference_title)
 
 
 def attach_knowledge(ctx, documents, *, knowledge_query='', pinned_ids=(), preferred_ids=()):

@@ -146,6 +146,13 @@ def test_draft_approval_version_and_schedule_evidence(env):
     asset = c.post('/api/assets', data={'draft_id': did}, files={'file': ('T-test.mp4', b'\x00\x00\x00\x18ftypmp42' + b'0'*32, 'video/mp4')})
     assert asset.status_code == 200, asset.text
     sched = c.post('/api/schedules', json={'draft_id': did, 'platform': '抖音', 'account': '自有账号', 'planned_at': '2026-11-20T10:00:00+08:00'}).json()
+    assert not sched.get('touchpoints')
+    touchpoint = {'channel': '视频号', 'status': 'producing'}
+    assert c.patch(f"/api/schedules/{sched['id']}/touchpoints", json=touchpoint).status_code == 422
+    channels = c.post('/api/schedules', json={'draft_id': did, 'platform': '视频号', 'account': '自有账号', 'planned_at': '2026-11-20T10:00:00+08:00'}).json()
+    assert len(channels['touchpoints']) == 6
+    updated = c.patch(f"/api/schedules/{channels['id']}/touchpoints", json=touchpoint)
+    assert updated.status_code == 200 and updated.json()['touchpoints']['视频号'] == 'producing'
     assert c.patch(f"/api/schedules/{sched['id']}", json={'status': 'published'}).status_code == 422
     assert c.patch(f"/api/schedules/{sched['id']}", json={'status': 'published', 'evidence': 'https://example.org/post/1'}).status_code == 200
 
@@ -417,6 +424,27 @@ def test_live_review_preview_uses_saved_rules_and_does_not_modify_draft(env):
     changed = users['member'].post(endpoint, json=editing).json()['checks'][-1]
     assert changed['min_match'] == 9 and changed['threshold'] == .07
     assert changed['ratio'] == 0 and changed['snippets'] == []
+
+
+def test_rewrite_rejects_copied_opening_and_title_below_overlap_threshold(env):
+    app, admin, users, ip, _ = env
+    material = admin.post('/api/records/materials', json={
+        'ip_id': ip['id'], 'title': '原作标题', 'body': '作品描述',
+    }).json()
+    draft = admin.post(f"/api/materials/{material['id']}/adopt", json={'skill': 'viral-rewrite-writer'}).json()
+    changes = {'version': 1, 'body': '你好吗？先把家里的旧保单找出来。记录保障期限和保费，再按家庭开支重新做一遍预算。',
+               'reference': '你好吗！今天咱们聊聊另一件事。', 'fact_status': 'none'}
+    edited = admin.patch(f"/api/drafts/{draft['id']}", json=changes).json()
+    report = {rule['id']: rule for rule in edited['checks']}
+    assert report['overlap']['passed']
+    for key in ('reference_title', 'reference_opening'):
+        assert not report[key]['passed'] and report[key]['blocking']
+    approve = f"/api/drafts/{draft['id']}/approve"
+    assert admin.post(approve, json={'version': 2}).status_code == 409
+    preview = admin.post('/api/drafts/checks', json={
+        'draft_id': draft['id'], 'version': 2, 'title': '家庭保单怎么整理', 'body': changes['body'][4:],
+    }).json()
+    assert all(rule['passed'] for rule in preview['checks'] if rule['blocking'])
 
 
 def test_legacy_material_description_waits_for_real_reference(env):

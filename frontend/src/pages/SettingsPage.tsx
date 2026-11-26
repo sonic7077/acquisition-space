@@ -91,10 +91,10 @@ const CONFIG: Record<
   },
   rules: {
     name: "审稿规则",
-    desc: "来源重合检查独立于人工改稿指标。",
+    desc: "超过重合度上限时，须改稿后才能批准。其他自动检查与人工复核规则见下方。",
     fields: [
-      ["overlap_min", "最短连续匹配字符数", "number"],
-      ["overlap_max", "最大重合占比（0—1）", "number"],
+      ["overlap_min", "连续相同字符数下限（字）", "number"],
+      ["overlap_max", "允许的最高重合度（%）", "number"],
     ],
   },
 };
@@ -124,7 +124,7 @@ export default function SettingsPage(c: Ctx) {
       const v = f.get(key) as string;
       if (type === "password") {
         if (v) data[key] = v;
-      } else data[key] = type === "number" ? Number(v) : v;
+      } else data[key] = key === "overlap_max" ? Number(v) / 100 : type === "number" ? Number(v) : v;
     });
     if (["model","collection","feishu"].includes(tab)) data.enabled = f.get("enabled") === "on";
     if (tab === "executor") {
@@ -183,10 +183,15 @@ export default function SettingsPage(c: Ctx) {
                   {type === "auth_mode" ? <select name={key} defaultValue={settings[tab]?.auth_mode||'app'}><option value="app">应用 App ID / App Secret</option><option value="cli">本机已授权飞书 CLI（无需复制密钥）</option></select> : type === "executor_mode" ? <select name={key} defaultValue={settings[tab]?.mode||'manual'}><option value="manual">仅手工登记（不调外部执行器）</option><option value="server_direct">服务器联通 · 同机直连小V猫 (server_direct)</option><option value="server_relay">服务器联通 · 托管桌面执行机 (server_relay)</option><option value="client_local">Web前端 + 本机小V猫模式 (client_local)</option><option value="hybrid">混合模式（按账号绑定节点自动路由）</option></select> : type === "textarea" ? <textarea name={key} rows={5} defaultValue={settings[tab]?.[key] || ''} placeholder={'{"works":{"likes":"点赞数","author_id":"博主关联"}}'} /> : <input
                     name={key}
                     type={type || "text"}
-                    step={tab === "discovery" ? "any" : key === "overlap_max" ? "0.01" : undefined}
+                    step={tab === "discovery" || key === "overlap_max" ? "any" : undefined}
+                    min={key === "overlap_min" ? 2 : key === "overlap_max" ? 0 : undefined}
+                    max={tab === "rules" ? 100 : undefined}
+                    required={tab === "rules"}
                     autoComplete={type === "password" ? "new-password" : "off"}
                     defaultValue={
-                      type === "password" ? "" : (settings[tab]?.[key] ?? (key === "base_url" && tab === "collection" ? "https://api.tikhub.io" : key === "base_url" && tab === "executor" ? "http://127.0.0.1:3199/mcp" : key === "daily_budget" ? 100 : key === "catchup_minutes" || key === "preflight_minutes" ? 30 : ""))
+                      key === "overlap_max" ? Number(((settings.rules?.overlap_max ?? .08) * 100).toPrecision(15))
+                      : key === "overlap_min" ? (settings.rules?.overlap_min ?? 8)
+                      : type === "password" ? "" : (settings[tab]?.[key] ?? (key === "base_url" && tab === "collection" ? "https://api.tikhub.io" : key === "base_url" && tab === "executor" ? "http://127.0.0.1:3199/mcp" : key === "daily_budget" ? 100 : key === "catchup_minutes" || key === "preflight_minutes" ? 30 : ""))
                     }
                     readOnly={(tab === "collection" && key === "base_url")}
                     placeholder={
@@ -243,13 +248,29 @@ export default function SettingsPage(c: Ctx) {
                   </button>
                 )}
               </div>
-              <p className="muted">
+              {CONFIG[tab].fields.some(([, , type]) => type === "password") && <p className="muted">
                 密钥不会回传到浏览器或记录在审计日志中。备份时请保留本机主密钥文件。
-              </p>
+              </p>}
             </form>
           ) : (
             <p>正在加载管理员设置…</p>
           )}
+          {tab === "rules" && <div className="schema-preview">
+            <h3>自动阻塞项</h3>
+            <ul>
+              <li>复刻口播须提供已确认的对标逐字稿。去除空格和标点后，统计新稿正文中符合连续匹配要求的字符，每个位置只计一次。重合度为命中字数除以处理后的新稿正文总字数，等于上限可以通过。</li>
+              <li>复刻口播的标题与已关联作品的原标题、正文首句与对标逐字稿首句分别比较。去除空格和标点后完全相同，须改写。</li>
+              <li>正文和标题均须填写。口播标题最多 16 字，正文按写手设置检查并限制在 1500 字以内。</li>
+              <li>涉及数字、政策、产品条款等事实，须核对来源和有效日期。无法核实的具体表述应删除；确认稿件事实状态后再批准。</li>
+              <li>口播命中「加微信」「私信领」「扣 1」「关注就送」等导流话术须删除。</li>
+            </ul>
+            <h3>改稿提示与人工复核</h3>
+            <ul>
+              <li>系统提示破折号、「评论区」字样和结尾资料钩子。可在结尾说明真实可提供的资料及其用途。</li>
+              <li>借鉴标题公式、开场结构和段落作用时，换成可核实的自有案例、经历和表达。人工核对节奏、口播篇幅及未命中的导流变体。</li>
+            </ul>
+            <a href="https://vcntpxdvgs9d.feishu.cn/docx/M4hxdZV1yoZ1ztxoQtWcXChHnaf" target="_blank" rel="noreferrer">查看飞书讲师原文 ↗</a>
+          </div>}
           {tab === "discovery" && <p className="muted">当前配置版本 v{settings?.discovery?.version||1}。样本不足或缺失数据时不计算对应指标；本人/停用账号不进入对标推荐。所有成员可在素材和使用说明中查看规则，只有管理员可修改。</p>}
           {tab === 'collection' && <div className="schema-preview"><a href="https://docs.tikhub.io/doc-4579297" target="_blank" rel="noreferrer">查看 TikHub 官方说明 ↗</a><p className="muted">当前接入抖音、小红书与视频号。搜索任务自动读取范围内作品评论；不会因错误自动反复请求。每日调用预算是本系统的请求上限，实际计费以服务商账单为准。</p></div>}
           {tab === 'executor' && <div className="schema-preview">

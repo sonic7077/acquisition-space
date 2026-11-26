@@ -31,7 +31,7 @@ from ..db import (
 )
 from ..knowledge import verified_document
 from ..security import active_ip, approver, can_ip, require_ip
-from ..writing import checks
+from ..writing import draft_checks
 from .qr import render_qr_png
 from .transport import (
     MediaRef,
@@ -962,7 +962,7 @@ class VcatOperationsService:
         if p.get("approved_version") != expected_version or p.get("version") != expected_version:
             return "稿件批准版本已变更或失效，请重新审核"
         rules = self._settings(db).get("rules", {})
-        if any(not c["passed"] and c["blocking"] for c in checks(p, rules)):
+        if any(not c["passed"] and c["blocking"] for c in draft_checks(db, p, rules)):
             return "稿件不再满足审稿阻塞规则"
         for src_id in set(p.get("source_ids", [])) | {x["id"] for x in p.get("sources", [])}:
             src = db.get(Record, src_id)
@@ -1019,6 +1019,8 @@ class VcatOperationsService:
                 raise HTTPException(403, "没有此平台账号的操作权限")
             if acc.ip_id and sched.ip_id and acc.ip_id != sched.ip_id:
                 raise HTTPException(403, "平台账号与排期所属 IP 不一致")
+            if PLATFORM_CODE_MAP.get(sp.get("platform")) != acc.platform:
+                raise HTTPException(422, "平台账号与排期的发布平台不一致")
 
             draft = db.get(Record, sp["draft_id"])
             err = self._validate_draft_ready(db, draft, int(sp["version"]))

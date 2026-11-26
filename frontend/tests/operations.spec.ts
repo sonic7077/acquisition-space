@@ -94,7 +94,10 @@ test("运营主菜单、双模式设置、账号授权iframe、扫脸QR、草稿
   await expect(page.getByRole("heading", { name: "发布任务", exact: true })).toBeVisible();
   const dlg = page.getByRole("dialog");
   await expect(dlg.getByLabel("选择已有排期")).not.toHaveValue("");
-  await dlg.getByLabel("目标平台账号").selectOption({ index: 1 });
+  const account = dlg.getByLabel("目标平台账号");
+  await expect(account.getByRole("option", { name: /测试抖音号/ })).toHaveCount(1);
+  await expect(account.getByRole("option", { name: /测试视频号/ })).toHaveCount(0);
+  await account.selectOption({ index: 1 });
   await dlg.getByLabel("执行动作").selectOption("draft");
   await dlg.getByRole("button", { name: "提交执行" }).click();
   await expect(page.getByText("已推草稿箱")).toBeVisible();

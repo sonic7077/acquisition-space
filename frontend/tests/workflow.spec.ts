@@ -143,6 +143,21 @@ test("管理员完成知识上传、写手、审稿、排期和模型设置", as
   await page.getByRole("button", { name: "拍摄上传", exact: true }).click();
   await expect(page.getByRole("heading", { name: "AI视频生成", exact: true })).toHaveCount(0);
   await page.getByLabel("明确关联稿件").selectOption({ index: 1 });
+  // Delay delivery of the response to React while retaining native upload events.
+  await page.evaluate(() => {
+    const responseReady = new Promise<void>((resolve) => {
+      window.addEventListener("test:confirm-asset-upload", () => resolve(), { once: true });
+    });
+    const nativeSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function (body) {
+      XMLHttpRequest.prototype.send = nativeSend;
+      const onload = this.onload;
+      this.onload = (event) => {
+        void responseReady.then(() => onload?.call(this, event));
+      };
+      return nativeSend.call(this, body);
+    };
+  });
   const videoChooser = page.waitForEvent("filechooser");
   await page.getByRole("button", { name: "选择视频与封面" }).click();
   await (
@@ -156,7 +171,17 @@ test("管理员完成知识上传、写手、审稿、排期和模型设置", as
       Buffer.alloc(32),
     ]),
   });
-  await expect(page.getByText("video.mp4", { exact: true })).toBeVisible();
+  try {
+    const progress = page.getByRole("progressbar", { name: "video.mp4 上传进度" });
+    await expect(progress).toHaveAttribute("value", "100");
+    await expect(page.getByText("服务器校验中")).toBeVisible();
+    await expect(page.getByRole("button", { name: "选择视频与封面" })).toBeDisabled();
+    await expect(page.getByRole("table").getByText("video.mp4", { exact: true })).toHaveCount(0);
+  } finally {
+    await page.evaluate(() => window.dispatchEvent(new Event("test:confirm-asset-upload")));
+  }
+  await expect(page.getByRole("table").getByText("video.mp4", { exact: true })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "已关联" })).toBeVisible();
   await page.getByRole("button", { name: "发布排期", exact: true }).click();
   await page.getByRole("button", { name: "新增排期" }).click();
   await page.getByLabel("当前批准稿件").selectOption({ index: 1 });
@@ -165,6 +190,9 @@ test("管理员完成知识上传、写手、审稿、排期和模型设置", as
   await page.getByRole("button", { name: "创建计划", exact: true }).click();
   await expect(page.getByRole("dialog")).not.toBeVisible();
   await expect(page.getByText("顾问视频号 / 抖音")).toBeVisible();
+  await page.getByRole("button", { name: "详情", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "微信生态 · 一题六触点" })).toHaveCount(0);
+  await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
   await page.getByRole("button", { name: "系统设置", exact: true }).click();
   await expect(page.getByRole("button", { name: "视频生成", exact: true })).toHaveCount(0);
   await expect(

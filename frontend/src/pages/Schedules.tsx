@@ -12,6 +12,9 @@ import {
   STATE,
 } from "../components/ui";
 import { type Ctx, useRows, filterIp } from "../context";
+
+const wechatPlatforms = new Set(["视频号", "公众号"]);
+
 export default function Schedules(c: Ctx) {
   const rows = filterIp(useRows("/schedules", c.version), c.ip),
     drafts = filterIp(useRows("/drafts", c.version), c.ip).filter(
@@ -129,7 +132,7 @@ export default function Schedules(c: Ctx) {
                           className="text-button"
                           onClick={() => setDetail(r)}
                         >
-                          详情 / 微信生态
+                          {wechatPlatforms.has(r.platform) ? "详情 / 微信生态" : "详情"}
                         </button>
                         {!["cancelled", "needs_review"].includes(r.status) && (
                           <button
@@ -223,51 +226,55 @@ export default function Schedules(c: Ctx) {
             </Field>
             <button className="primary">保存执行结果</button>
           </form>
-          <h3 className="subheading">微信生态 · 一题六触点</h3>
-          <div className="touchpoints">
-            {Object.entries(detail.touchpoints || {}).map(
-              ([channel, state]) => (
-                <div key={channel}>
-                  <strong>{channel}</strong>
-                  <select
-                    aria-label={channel + "状态"}
-                    value={state as string}
-                    onChange={(e) => {
-                      const status = e.target.value;
-                      const evidence = ["published", "skipped"].includes(status)
-                        ? window.prompt(
-                            status === "published"
-                              ? "请输入发表凭证"
-                              : "请输入跳过原因",
-                          ) || ""
-                        : "";
-                      c.run(async () => {
-                        const r = await patch(
-                          `/schedules/${detail.id}/touchpoints`,
-                          { channel, status, evidence },
-                        );
-                        setDetail(r);
-                      }, "触点状态已保存");
-                    }}
-                  >
-                    {[
-                      "unprepared",
-                      "producing",
-                      "review",
-                      "dependency",
-                      "manual",
-                      "published",
-                      "skipped",
-                    ].map((s) => (
-                      <option value={s} key={s}>
-                        {STATE[s]}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              ),
-            )}
-          </div>
+          {wechatPlatforms.has(detail.platform) && (
+            <section aria-label="微信生态触点">
+              <h3 className="subheading">微信生态 · 一题六触点</h3>
+              <div className="touchpoints">
+                {Object.entries(detail.touchpoints || {}).map(
+                  ([channel, state]) => (
+                    <div key={channel}>
+                      <strong>{channel}</strong>
+                      <select
+                        aria-label={channel + "状态"}
+                        value={state as string}
+                        onChange={(e) => {
+                          const status = e.target.value;
+                          const evidence = ["published", "skipped"].includes(status)
+                            ? window.prompt(
+                                status === "published"
+                                  ? "请输入发表凭证"
+                                  : "请输入跳过原因",
+                              ) || ""
+                            : "";
+                          c.run(async () => {
+                            const r = await patch(
+                              `/schedules/${detail.id}/touchpoints`,
+                              { channel, status, evidence },
+                            );
+                            setDetail(r);
+                          }, "触点状态已保存");
+                        }}
+                      >
+                        {[
+                          "unprepared",
+                          "producing",
+                          "review",
+                          "dependency",
+                          "manual",
+                          "published",
+                          "skipped",
+                        ].map((s) => (
+                          <option value={s} key={s}>
+                            {STATE[s]}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ),
+                )}
+              </div>
+            </section>
+          )}
           <Notice>
             仅记录实际发表结果。生成文案、上传视频或暂存草稿，都不等同于发表。
           </Notice>
