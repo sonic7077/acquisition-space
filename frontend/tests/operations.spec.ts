@@ -103,7 +103,8 @@ test("运营主菜单、双模式设置、账号授权iframe、扫脸QR、草稿
   await expect(page.getByText("已推草稿箱")).toBeVisible();
   await page.getByRole("button", { name: "一键转正式发布" }).first().click();
   await page.getByRole("dialog").getByRole("button", { name: "确认转正式发布" }).click();
-  await expect(page.getByText("平台已受理")).toBeVisible();
+  await expect(page.getByText("已发表").first()).toBeVisible();
+  await expect(page.getByText(/已查询确认/).first()).toBeVisible();
 
   // 4. P1/P2 运营 -> 作品与数据: sync posts, check daily modal, visibility modify & disabled delete placeholder
   await page.getByRole("button", { name: "作品与数据", exact: true }).click();

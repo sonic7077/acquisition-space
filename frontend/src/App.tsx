@@ -155,9 +155,9 @@ export default function App() {
     if (page !== "materials") setPreferredWriter(null);
   }, [page]);
   const go = (next: string, selectedId?: string) => {
-    setSelectedDraftId(next === "drafts" ? selectedId : undefined);
+    setSelectedDraftId(next === "drafts" || next === "assets" ? selectedId : undefined);
     setSelectedScheduleId(next === "ops-tasks" ? selectedId : undefined);
-    if ((next === "drafts" || next === "ops-tasks") && selectedId) setIp("");
+    if ((next === "drafts" || next === "assets" || next === "ops-tasks") && selectedId) setIp("");
     location.hash = next;
     setPage(next);
     setError("");
@@ -342,9 +342,9 @@ export default function App() {
           ) : page === "users" ? (
             <UsersPage {...ctx} />
           ) : page === "drafts" ? (
-            <Drafts key={selectedDraftId} {...ctx} initialDraftId={selectedDraftId} />
+            <Drafts key={selectedDraftId || "drafts"} {...ctx} initialDraftId={selectedDraftId} />
           ) : page === "assets" ? (
-            <Assets key={ip} {...ctx} />
+            <Assets key={selectedDraftId || ip || "assets"} {...ctx} initialDraftId={selectedDraftId} />
           ) : page === "schedules" ? (
             <Schedules {...ctx} />
           ) : page === "ops-accounts" ? (

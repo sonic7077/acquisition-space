@@ -1,4 +1,4 @@
-import { useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Search, Plus } from "lucide-react";
 import { post, patch, type Row } from "../api";
 import { Badge, Empty, Card, Modal, Field, Notice } from "../components/ui";
@@ -20,6 +20,9 @@ export default function Drafts(c: Ctx & { initialDraftId?: string }) {
     [tele, setTele] = useState(false),
     [rewrite,setRewrite] = useState<Row|null>(null),
     [analysis,setAnalysis] = useState<Row|null>(null);
+  useEffect(() => {
+    if (c.initialDraftId) setSelected(c.initialDraftId);
+  }, [c.initialDraftId]);
   const current = rows.find((d) => d.id === selected) || rows[0];
   const demand = current?.demand_snapshot;
   const editBaseline = useRef<Row | null>(null);

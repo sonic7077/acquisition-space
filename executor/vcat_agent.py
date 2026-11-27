@@ -183,7 +183,7 @@ class VcatAgentRunner:
         os.chmod(self.creds_path, 0o600)
         return data
 
-    def _mcp_post(self, payload: dict[str, Any], notification: bool = False) -> dict[str, Any]:
+    def _mcp_post(self, payload: dict[str, Any], notification: bool = False, timeout: float = 30.0) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.mcp_token}",
             "Content-Type": "application/json",
@@ -194,7 +194,7 @@ class VcatAgentRunner:
         if self._mcp_client is not None:
             resp = self._mcp_client.post(self.mcp_url, headers=headers, json=payload)
         else:
-            with httpx.Client(timeout=30, follow_redirects=False, trust_env=False) as c:
+            with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as c:
                 resp = c.post(self.mcp_url, headers=headers, json=payload)
         sid = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
         if sid:
@@ -306,13 +306,15 @@ class VcatAgentRunner:
             self._last_mcp_ts = time.monotonic()
             self.probe_local_mcp()
             self._req_id += 1
+            call_timeout = 120.0 if tool_name in ("vcat_create_publish_task", "vcat_create_draft", "vcat_publish_draft") else 30.0
             mcp_res = self._mcp_post(
                 {
                     "jsonrpc": "2.0",
                     "id": self._req_id,
                     "method": "tools/call",
                     "params": {"name": tool_name, "arguments": args},
-                }
+                },
+                timeout=call_timeout,
             )
             if "error" in mcp_res:
                 res = {"ok": False, "status": "FAILED", "payload": mcp_res["error"], "error_message": str(mcp_res["error"])}

@@ -52,6 +52,11 @@ class PublishDraftInput(BaseModel):
     platform_options: dict | None = None
 
 
+class RepublishAttemptInput(BaseModel):
+    mode: str | None = None
+    schedule_owner: str | None = None
+
+
 class DraftReplyInput(BaseModel):
     account_id: str = Field(min_length=1)
     comment_id: str | None = None
@@ -215,6 +220,10 @@ def register_operations(app, authenticated_user):
     def list_publish_tasks(ip_id: str = "", actor=Depends(actor_dep)):
         return service.list_attempts(actor, ip_id=ip_id)
 
+    @app.post("/api/ops/publish-tasks/reconcile-active")
+    def reconcile_active_attempts(ip_id: str = "", actor=Depends(actor_dep)):
+        return service.reconcile_active_attempts(actor, ip_id=ip_id)
+
     @app.post("/api/ops/publish-tasks/{attempt_id}/reconcile")
     def reconcile_attempt(attempt_id: str, actor=Depends(actor_dep)):
         return service.reconcile_attempt(actor, attempt_id)
@@ -226,6 +235,15 @@ def register_operations(app, authenticated_user):
     @app.post("/api/ops/publish-tasks/{attempt_id}/retry")
     def retry_attempt(attempt_id: str, actor=Depends(actor_dep)):
         return service.retry_attempt(actor, attempt_id)
+
+    @app.post("/api/ops/publish-tasks/{attempt_id}/republish")
+    def republish_attempt(attempt_id: str, data: RepublishAttemptInput | None = None, actor=Depends(actor_dep)):
+        return service.republish_attempt(
+            actor,
+            attempt_id,
+            mode=data.mode if data else None,
+            schedule_owner=data.schedule_owner if data else None,
+        )
 
     @app.post("/api/ops/publish-tasks/{attempt_id}/confirm-published")
     def confirm_wechat_published(attempt_id: str, data: ConfirmPublishedInput, actor=Depends(actor_dep)):

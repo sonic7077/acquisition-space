@@ -28,6 +28,8 @@ class MockXiaovmaoState:
         self.publish_tasks: list[dict] = []
         self.timeout_next_publish = False
         self.fail_next_tool = False
+        self.next_publish_status = "published"
+        self.next_publish_error: str | None = None
         self.accounts = [
             {
                 "uid": "dy_001",
@@ -159,7 +161,17 @@ def start_mock_mcp_server(token: str = "mock-mcp-token-secret") -> tuple[Threadi
                         state.timeout_next_publish = False
                         time.sleep(2.5)
                     lid = f"local_{len(state.publish_tasks) + 1}"
-                    state.publish_tasks.append({"localId": lid, "uid": args.get("uid"), "status": "published", "postId": f"post_{lid}", "url": f"https://example.org/{lid}"})
+                    st = state.next_publish_status
+                    err = state.next_publish_error
+                    state.next_publish_status = "published"
+                    state.next_publish_error = None
+                    entry = {"localId": lid, "uid": args.get("uid"), "batchName": args.get("batchName"), "title": args.get("title"), "status": st}
+                    if st == "published":
+                        entry["postId"] = f"post_{lid}"
+                        entry["url"] = f"https://example.org/{lid}"
+                    elif err:
+                        entry["error"] = err
+                    state.publish_tasks.append(entry)
                     res = {"content": [{"type": "text", "text": json.dumps({"localId": lid})}]}
                 elif tname == "vcat_list_publish_tasks":
                     res = {"content": [{"type": "text", "text": json.dumps({"total": len(state.publish_tasks), "list": state.publish_tasks})}]}
@@ -226,7 +238,17 @@ def start_mock_mcp_server(token: str = "mock-mcp-token-secret") -> tuple[Threadi
                     res = {"content": [{"type": "text", "text": json.dumps({"total": len(state.drafts), "list": state.drafts})}]}
                 elif tname == "vcat_publish_draft":
                     lid = f"local_{len(state.publish_tasks) + 1}"
-                    state.publish_tasks.append({"localId": lid, "uid": args.get("uid"), "draftId": args.get("draftId"), "status": "published", "postId": f"post_{lid}", "url": f"https://example.org/{lid}"})
+                    st = state.next_publish_status
+                    err = state.next_publish_error
+                    state.next_publish_status = "published"
+                    state.next_publish_error = None
+                    entry = {"localId": lid, "uid": args.get("uid"), "draftId": args.get("draftId"), "batchName": args.get("batchName"), "status": st}
+                    if st == "published":
+                        entry["postId"] = f"post_{lid}"
+                        entry["url"] = f"https://example.org/{lid}"
+                    elif err:
+                        entry["error"] = err
+                    state.publish_tasks.append(entry)
                     res = {"content": [{"type": "text", "text": json.dumps({"localId": lid})}]}
                 elif tname == "vcat_list_comments":
                     res = {"content": [{"type": "text", "text": json.dumps({"total": 1, "list": [{"commentId": "cmt_1", "uid": "dy_001", "content": "怎么联系购买", "nickname": "潜在客户", "replied": False, "createTime": "2026-11-26 11:00:00"}]})}]}
@@ -342,13 +364,16 @@ def test_server_direct_full_lifecycle_and_sanitization(tmp_path):
         ver = member.post(f"/api/ops/accounts/{accs['ch_001']['id']}/verify", json={}).json()
         assert ver["is_verified"] is True
 
-        # Dispatch draft + publish + reconcile
+        # Dispatch draft + publish + immediate verification
         d_res = member.post(f"/api/ops/schedules/{sched['id']}/dispatch", json={"account_id": accs["dy_001"]["id"], "mode": "draft"}).json()
         assert d_res["state"] == "DRAFT_PUSHED"
+        assert d_res["verification_status"] == "confirmed_success"
         assert mcp_state.drafts[0]["args"]["videoPath"].endswith(".mp4")
 
         p_res = member.post(f"/api/ops/schedules/{sched['id']}/dispatch", json={"account_id": accs["dy_001"]["id"], "mode": "publish"}).json()
-        assert p_res["state"] == "ACCEPTED"
+        assert p_res["state"] == "PUBLISHED"
+        assert p_res["verification_status"] == "confirmed_success"
+        assert p_res["platform_post_id"] == "post_local_1"
         # Idempotent re-dispatch with same snapshot returns existing attempt
         p_dup = member.post(f"/api/ops/schedules/{sched['id']}/dispatch", json={"account_id": accs["dy_001"]["id"], "mode": "publish"}).json()
         assert p_dup["id"] == p_res["id"]
@@ -518,12 +543,15 @@ def test_p0_closure_remove_unbind_reconcile_revoke_and_cancel(tmp_path):
         conn.exec_driver_sql("CREATE TABLE executor_nodes (id TEXT PRIMARY KEY, name TEXT, node_scope TEXT, transport_mode TEXT, status TEXT)")
         conn.exec_driver_sql("CREATE TABLE platform_accounts (id TEXT PRIMARY KEY, node_id TEXT, vendor_uid TEXT, platform TEXT)")
         conn.exec_driver_sql("CREATE TABLE auth_challenges (id TEXT PRIMARY KEY, node_id TEXT, platform TEXT, challenge_type TEXT, status TEXT, expires_at TEXT)")
+        conn.exec_driver_sql("CREATE TABLE publish_attempts (id TEXT PRIMARY KEY, target_id TEXT, attempt_no INTEGER, idempotency_key TEXT, state TEXT)")
     eng_raw.dispose()
     eng2, _ = database(legacy_db)
     with eng2.begin() as conn:
         assert "revoked_at" in {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(executor_nodes)").fetchall()}
         assert "removed_at" in {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(platform_accounts)").fetchall()}
         assert "vendor_link_id" in {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(auth_challenges)").fetchall()}
+        pa_cols = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(publish_attempts)").fetchall()}
+        assert {"vendor_batch_name", "remote_status", "verification_status", "verification_detail", "last_verified_at", "verify_attempts"} <= pa_cols
     eng2.dispose()
 
     # Verify deletion tools are NOT allowed in agent allowlist or backend transport
@@ -623,7 +651,8 @@ def test_p1_p2_closure_draft_promote_interactions_monitors_and_posts(tmp_path):
 
         promoted = member.post(f"/api/ops/publish-tasks/{draft_att['id']}/publish-draft", json={"confirm": True, "schedule_owner": "server"})
         assert promoted.status_code == 200, promoted.text
-        assert promoted.json()["state"] == "ACCEPTED"
+        assert promoted.json()["state"] == "PUBLISHED"
+        assert promoted.json()["verification_status"] == "confirmed_success"
         assert any(t == "vcat_publish_draft" for t, _ in mcp_state.calls)
         # Duplicate promote blocked 409
         assert member.post(f"/api/ops/publish-tasks/{draft_att['id']}/publish-draft", json={"confirm": True}).status_code == 409
@@ -670,5 +699,185 @@ def test_p1_p2_closure_draft_promote_interactions_monitors_and_posts(tmp_path):
         assert admin.post("/api/ops/accounts/dedupe", json={"confirm": True}).status_code == 200
         assert admin.delete(f"/api/ops/posts/{post_id}").status_code in (404, 405)
         assert admin.post(f"/api/ops/posts/{post_id}/delete").status_code in (404, 405)
+    finally:
+        mcp_srv.shutdown()
+
+
+def test_publish_verification_failure_feedback_and_republish_lifecycle(tmp_path):
+    mcp_srv, mcp_url, mcp_state = start_mock_mcp_server()
+    try:
+        app, admin, member, ip, draft, vid, cov, sched = _setup_workspace(tmp_path)
+        assert admin.put(
+            "/api/settings",
+            json={"executor": {"mode": "server_direct", "base_url": mcp_url, "token": "mock-mcp-token-secret"}},
+        ).status_code == 200
+        accs = {a["vendor_uid"]: a for a in admin.post("/api/ops/accounts/sync", json={}).json()["accounts"]}
+        dy_id = accs["dy_001"]["id"]
+        xhs_id = accs["xhs_001"]["id"]
+        admin.post(f"/api/ops/accounts/{dy_id}/bind", json={"ip_id": ip["id"]})
+        admin.post(f"/api/ops/accounts/{xhs_id}/bind", json={"ip_id": ip["id"]})
+
+        # 1. Long-running publish: initial state is publishing -> later rejected by platform
+        mcp_state.next_publish_status = "publishing"
+        first = member.post(
+            f"/api/ops/schedules/{sched['id']}/dispatch",
+            json={"account_id": dy_id, "mode": "publish"},
+        )
+        assert first.status_code == 200, first.text
+        f_data = first.json()
+        assert f_data["state"] == "PUBLISHING"
+        assert f_data["verification_status"] == "verifying"
+
+        # Simulate platform rejecting the video due to format mismatch
+        mcp_state.publish_tasks[-1]["status"] = "failed"
+        mcp_state.publish_tasks[-1]["error"] = "发布被拒绝：视频格式不符合要求（编码不支持）"
+
+        # Force last_verified_at slightly in the past so reconcile-active picks it up immediately
+        with app.state.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            att = db.get(PublishAttempt, f_data["id"])
+            att.last_verified_at = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+            db.commit()
+
+        rec_act = member.post("/api/ops/publish-tasks/reconcile-active").json()
+        assert rec_act["reconciled"] == 1
+        rejected = next(x for x in rec_act["items"] if x["id"] == f_data["id"])
+        assert rejected["state"] == "REJECTED"
+        assert rejected["verification_status"] == "confirmed_failed"
+        assert "格式不符合" in (rejected["error_message"] or "")
+
+        # Also verify publish_worker.run_once reconciles active attempts automatically
+        s_worker = admin.post(
+            "/api/schedules",
+            json={"draft_id": draft["id"], "platform": "小红书", "account": "测试小红书", "planned_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()},
+        ).json()
+        mcp_state.next_publish_status = "publishing"
+        w_att = member.post(f"/api/ops/schedules/{s_worker['id']}/dispatch", json={"account_id": xhs_id, "mode": "publish"}).json()
+        assert w_att["state"] == "PUBLISHING"
+        mcp_state.publish_tasks[-1]["status"] = "published"
+        mcp_state.publish_tasks[-1]["postId"] = "xhs_worker_ok"
+        mcp_state.publish_tasks[-1]["url"] = "https://example.org/xhs_worker_ok"
+        with app.state.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            att_w = db.get(PublishAttempt, w_att["id"])
+            att_w.last_verified_at = (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat()
+            db.commit()
+        assert run_publish_worker_once(app) is True
+        with app.state.Session() as db:
+            att_w2 = db.get(PublishAttempt, w_att["id"])
+            assert att_w2.state == "PUBLISHED"
+            assert att_w2.verification_status == "confirmed_success"
+
+        # 2. Upload fixed video asset -> republish failed attempt -> succeeds with new asset
+        fixed_vid = admin.post(
+            "/api/assets",
+            data={"draft_id": draft["id"]},
+            files={"file": ("fixed.mp4", b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x01", "video/mp4")},
+        ).json()
+        repub_1 = member.post(f"/api/ops/publish-tasks/{f_data['id']}/republish")
+        assert repub_1.status_code == 200, repub_1.text
+        r1 = repub_1.json()
+        assert r1["state"] == "PUBLISHED"
+        assert r1["verification_status"] == "confirmed_success"
+        assert r1["video_asset_id"] == fixed_vid["id"]
+        assert r1["attempt_no"] == 2
+
+        # 3. Edit draft text (v2 unapproved) -> reject -> republish blocked 409 -> approve v2 -> republish reuses video & uses new title
+        mcp_state.next_publish_status = "failed"
+        mcp_state.publish_tasks.append({"localId": "local_fail_text", "uid": "dy_001", "status": "failed", "error": "标题含敏感词"})
+        with app.state.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            t_txt = PublishTarget(
+                id="t_txt_fail",
+                schedule_id=sched["id"],
+                ip_id=ip["id"],
+                draft_id=draft["id"],
+                draft_version=draft["version"],
+                account_id=dy_id,
+                platform="Douyin",
+                approved_snapshot_json={"title": draft["title"], "desc": draft["body"], "video_asset_id": fixed_vid["id"], "video_hash": fixed_vid["hash"], "video_filename": fixed_vid["filename"]},
+                snapshot_hash="h_txt",
+                planned_at_utc=datetime.now(timezone.utc).isoformat(),
+                execution_mode="publish",
+                status="REJECTED",
+            )
+            a_txt = PublishAttempt(
+                id="a_txt_fail",
+                target_id="t_txt_fail",
+                attempt_no=1,
+                idempotency_key="k_txt_fail",
+                state="REJECTED",
+                node_id="server-direct-default",
+                error_class="PLATFORM_REJECTED",
+                error_message="标题含敏感词",
+                verification_status="confirmed_failed",
+            )
+            db.add_all([t_txt, a_txt])
+            db.commit()
+
+        d_v2 = admin.patch(
+            f"/api/drafts/{draft['id']}",
+            json={"version": draft["version"], "title": "合规新标题v2", "body": "修改后的合规正文内容。", "fact_status": "verified"},
+        ).json()
+        assert d_v2["version"] == 2 and d_v2["approved_version"] is None
+        assert member.post("/api/ops/publish-tasks/a_txt_fail/republish").status_code == 409
+
+        d_v2_ok = admin.post(f"/api/drafts/{draft['id']}/approve", json={"version": d_v2["version"]}).json()
+        assert d_v2_ok["approved_version"] == 2
+
+        mcp_state.next_publish_status = "published"
+        repub_2 = member.post("/api/ops/publish-tasks/a_txt_fail/republish")
+        assert repub_2.status_code == 200, repub_2.text
+        r2 = repub_2.json()
+        assert r2["state"] == "PUBLISHED"
+        assert r2["draft_version"] == 2
+        assert r2["title"] == "合规新标题v2"
+        assert r2["video_asset_id"] == fixed_vid["id"]
+
+        # 4. Draft verification & promote-draft failure feedback + republish + UNKNOWN guard
+        admin.post(
+            "/api/assets",
+            data={"draft_id": draft["id"]},
+            files={"file": ("v2_video.mp4", b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x02", "video/mp4")},
+        )
+        s_draft = admin.post(
+            "/api/schedules",
+            json={"draft_id": draft["id"], "platform": "小红书", "account": "测试小红书", "planned_at": datetime.now(timezone.utc).isoformat()},
+        ).json()
+        draft_att = member.post(f"/api/ops/schedules/{s_draft['id']}/dispatch", json={"account_id": xhs_id, "mode": "draft"}).json()
+        assert draft_att["state"] == "DRAFT_PUSHED"
+        assert draft_att["verification_status"] == "confirmed_success"
+
+        mcp_state.next_publish_status = "rejected"
+        mcp_state.next_publish_error = "草稿转正式发布被拒绝：视频时长不符"
+        promo_fail = member.post(
+            f"/api/ops/publish-tasks/{draft_att['id']}/publish-draft",
+            json={"confirm": True, "schedule_owner": "server"},
+        )
+        assert promo_fail.status_code == 200
+        pf = promo_fail.json()
+        assert pf["state"] == "REJECTED"
+        assert pf["verification_status"] == "confirmed_failed"
+        assert "视频时长不符" in (pf["error_message"] or "")
+
+        mcp_state.next_publish_status = "published"
+        promo_repub = member.post(f"/api/ops/publish-tasks/{pf['id']}/republish")
+        assert promo_repub.status_code == 200
+        assert promo_repub.json()["state"] == "PUBLISHED"
+
+        # UNKNOWN attempt cannot call republish
+        with app.state.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            a_unk = PublishAttempt(
+                id="a_unk_repub",
+                target_id="t_txt_fail",
+                attempt_no=99,
+                idempotency_key="k_unk_repub",
+                state="UNKNOWN",
+                node_id="server-direct-default",
+            )
+            db.add(a_unk)
+            db.commit()
+        assert member.post("/api/ops/publish-tasks/a_unk_repub/republish").status_code == 409
     finally:
         mcp_srv.shutdown()

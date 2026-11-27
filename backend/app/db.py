@@ -142,8 +142,14 @@ class PublishAttempt(Base):
     submit_started_at: Mapped[str | None] = mapped_column(String, nullable=True)
     vendor_local_id: Mapped[str | None] = mapped_column(String, nullable=True)
     vendor_draft_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    vendor_batch_name: Mapped[str | None] = mapped_column(String, nullable=True)
     platform_post_id: Mapped[str | None] = mapped_column(String, nullable=True)
     evidence_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remote_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    verification_status: Mapped[str] = mapped_column(String, default='pending')
+    verification_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_verified_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    verify_attempts: Mapped[int] = mapped_column(Integer, default=0)
     error_class: Mapped[str | None] = mapped_column(String, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
@@ -258,6 +264,12 @@ def database(path):
             ('executor_nodes', 'revoked_at', 'TEXT'),
             ('platform_accounts', 'removed_at', 'TEXT'),
             ('auth_challenges', 'vendor_link_id', 'TEXT'),
+            ('publish_attempts', 'vendor_batch_name', 'TEXT'),
+            ('publish_attempts', 'remote_status', 'TEXT'),
+            ('publish_attempts', 'verification_status', "TEXT DEFAULT 'pending'"),
+            ('publish_attempts', 'verification_detail', 'TEXT'),
+            ('publish_attempts', 'last_verified_at', 'TEXT'),
+            ('publish_attempts', 'verify_attempts', 'INTEGER DEFAULT 0'),
         ):
             cols = {row[1] for row in conn.exec_driver_sql(f'PRAGMA table_info({table})').fetchall()}
             if column not in cols:

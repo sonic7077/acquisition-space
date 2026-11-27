@@ -49,6 +49,7 @@ DAILY_LIMIT_PER_ACCOUNT = 3
 ACTIVE_DAILY_ATTEMPT_STATES = {
     "SUBMITTING",
     "ACCEPTED",
+    "PUBLISHING",
     "PLATFORM_SCHEDULED",
     "REVIEWING",
     "DRAFT_PUSHED",
@@ -84,6 +85,18 @@ def _shanghai_day_of(utc_iso: str) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(SHANGHAI_TZ).date().isoformat()
+
+
+def _parse_iso(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
 def _node_dict(n: ExecutorNode) -> dict[str, Any]:
@@ -134,6 +147,7 @@ def _account_dict(a: PlatformAccount, node: ExecutorNode | None = None) -> dict[
 
 
 def _attempt_dict(att: PublishAttempt, target: PublishTarget | None = None, acc: PlatformAccount | None = None) -> dict[str, Any]:
+    snap = (target.approved_snapshot_json or {}) if target else {}
     return {
         "id": att.id,
         "target_id": att.target_id,
@@ -148,7 +162,9 @@ def _attempt_dict(att: PublishAttempt, target: PublishTarget | None = None, acc:
         "schedule_owner": target.schedule_owner if target else None,
         "execution_mode": target.execution_mode if target else None,
         "planned_at_utc": target.planned_at_utc if target else None,
-        "title": (target.approved_snapshot_json or {}).get("title") if target else None,
+        "title": snap.get("title") if target else None,
+        "video_asset_id": snap.get("video_asset_id"),
+        "cover_asset_id": snap.get("cover_asset_id"),
         "attempt_no": att.attempt_no,
         "idempotency_key": att.idempotency_key,
         "state": att.state,
@@ -156,13 +172,206 @@ def _attempt_dict(att: PublishAttempt, target: PublishTarget | None = None, acc:
         "submit_started_at": att.submit_started_at,
         "vendor_local_id": att.vendor_local_id,
         "vendor_draft_id": att.vendor_draft_id,
+        "vendor_batch_name": att.vendor_batch_name,
         "platform_post_id": att.platform_post_id,
         "evidence_url": att.evidence_url,
+        "remote_status": att.remote_status,
+        "verification_status": att.verification_status or "pending",
+        "verification_detail": att.verification_detail,
+        "last_verified_at": att.last_verified_at,
+        "verify_attempts": att.verify_attempts or 0,
         "error_class": att.error_class,
         "error_message": att.error_message,
         "version": att.version,
         "updated_at": att.updated_at,
     }
+
+
+def _extract_remote_error(item: dict[str, Any]) -> str:
+    keys = (
+        "error",
+        "errorMsg",
+        "errorMessage",
+        "errMsg",
+        "failReason",
+        "rejectReason",
+        "reason",
+        "statusDesc",
+        "resultMsg",
+        "message",
+        "msg",
+        "detail",
+    )
+    for k in keys:
+        val = item.get(k)
+        if val is None:
+            continue
+        if isinstance(val, str):
+            clean = val.strip()
+            if clean:
+                return clean
+        elif isinstance(val, dict):
+            nested = _extract_remote_error(val)
+            if nested:
+                return nested
+            return json.dumps(val, ensure_ascii=False)
+        elif isinstance(val, list):
+            parts = [str(x).strip() for x in val if x is not None and str(x).strip()]
+            if parts:
+                return "；".join(parts)
+        else:
+            s = str(val).strip()
+            if s:
+                return s
+    return ""
+
+
+def _match_remote_publish_task(
+    tasks: list[dict[str, Any]],
+    att: PublishAttempt,
+    target: PublishTarget | None,
+) -> dict[str, Any] | None:
+    if att.vendor_local_id:
+        lid = str(att.vendor_local_id)
+        for item in tasks:
+            if not isinstance(item, dict):
+                continue
+            cand = item.get("localId") or item.get("id") or item.get("taskId")
+            if cand is not None and str(cand) == lid:
+                return item
+    if att.vendor_batch_name:
+        bname = str(att.vendor_batch_name)
+        for item in tasks:
+            if not isinstance(item, dict):
+                continue
+            cand = item.get("batchSource") or item.get("batchName")
+            if cand is not None and str(cand) == bname:
+                return item
+    if not att.vendor_local_id and target:
+        title = str((target.approved_snapshot_json or {}).get("title") or "").strip()
+        if title:
+            for item in tasks:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("title") or "").strip() == title:
+                    return item
+    return None
+
+
+def _apply_remote_publish_task(
+    att: PublishAttempt,
+    target: PublishTarget,
+    matched: dict[str, Any],
+) -> None:
+    st = str(
+        matched.get("status")
+        or matched.get("statusText")
+        or matched.get("state")
+        or matched.get("publishStatus")
+        or ""
+    ).strip()
+    st_low = st.lower()
+    post_id = (
+        matched.get("postId")
+        or matched.get("workId")
+        or matched.get("exportId")
+        or matched.get("feedId")
+        or matched.get("itemId")
+    )
+    url = (
+        matched.get("url")
+        or matched.get("workUrl")
+        or matched.get("publishUrl")
+        or matched.get("shareUrl")
+    )
+    err_text = _extract_remote_error(matched)
+    cand_local_id = matched.get("localId") or matched.get("id") or matched.get("taskId")
+    if not att.vendor_local_id and cand_local_id:
+        att.vendor_local_id = str(cand_local_id)
+
+    att.remote_status = st or "unknown"
+    att.last_verified_at = now()
+    att.verify_attempts = (att.verify_attempts or 0) + 1
+
+    if "cancel" in st_low or "取消" in st:
+        att.state = "CANCELLED"
+        target.status = "CANCELLED"
+        att.verification_status = "confirmed_failed"
+        att.verification_detail = "平台/小V猫发布任务已取消"
+        return
+
+    if (
+        any(k in st_low for k in ("fail", "reject", "error"))
+        or any(k in st for k in ("失败", "拒绝", "驳回", "违规", "异常", "不通过"))
+        or (not st_low and bool(err_text))
+    ):
+        reason = err_text or "平台返回发布失败（请检查视频格式、标题文案或账号登录状态）"
+        att.state = "REJECTED"
+        target.status = "REJECTED"
+        att.error_class = "PLATFORM_REJECTED"
+        att.error_message = reason
+        att.verification_status = "confirmed_failed"
+        att.verification_detail = f"平台确认发布失败：{reason}"
+        return
+
+    if any(k in st_low for k in ("success", "published", "succeed")) or any(k in st for k in ("成功", "已发布")):
+        if target.schedule_owner == "platform" and target.planned_at_utc > now() and not post_id and not url:
+            att.state = "PLATFORM_SCHEDULED"
+            target.status = "PLATFORM_SCHEDULED"
+            att.verification_status = "confirmed_success"
+            att.verification_detail = "已确认平台定时发布任务创建成功"
+        else:
+            att.state = "PUBLISHED"
+            target.status = "PUBLISHED"
+            if post_id:
+                att.platform_post_id = str(post_id)
+            if url:
+                att.evidence_url = str(url)
+            att.error_class = None
+            att.error_message = None
+            att.verification_status = "confirmed_success"
+            att.verification_detail = "已查询确认发布成功"
+        return
+
+    if "review" in st_low or "audit" in st_low or "审核" in st:
+        att.state = "REVIEWING"
+        target.status = "REVIEWING"
+        att.verification_status = "verifying"
+        att.verification_detail = "视频已上传，平台审核中，系统持续查询确认结果"
+        return
+
+    if "localtiming" in st_low or "timing" in st_low or "定时" in st:
+        att.state = "PLATFORM_SCHEDULED"
+        target.status = "PLATFORM_SCHEDULED"
+        att.verification_status = "confirmed_success"
+        att.verification_detail = "已进入定时发布队列，等待到点发布"
+        return
+
+    if "pause" in st_low or "暂停" in st:
+        att.state = "ACCEPTED"
+        target.status = "ACCEPTED"
+        att.verification_status = "verifying"
+        att.verification_detail = "小V猫发布队列已暂停，请在小V猫客户端恢复"
+        return
+
+    if (
+        "publish" in st_low
+        or "upload" in st_low
+        or "process" in st_low
+        or "run" in st_low
+        or "发布中" in st
+        or "上传中" in st
+    ):
+        att.state = "PUBLISHING"
+        target.status = "PUBLISHING"
+        att.verification_status = "verifying"
+        att.verification_detail = "正在上传视频并向平台提交，等待平台答复..."
+        return
+
+    att.state = "ACCEPTED"
+    target.status = "ACCEPTED"
+    att.verification_status = "verifying"
+    att.verification_detail = "任务已进入小V猫发布队列，等待执行上传与平台确认..."
 
 
 class VcatOperationsService:
@@ -217,6 +426,7 @@ class VcatOperationsService:
         media_refs: list[MediaRef] | None = None,
         requires_rate_limit: bool = True,
         sync_wait_sec: float = 20.0,
+        timeout_sec: int = 60,
         action_id: str | None = None,
     ) -> tuple[ExecutorNode, VcatActionResult]:
         with self.Session() as db:
@@ -237,6 +447,7 @@ class VcatOperationsService:
             tool_name=tool_name,
             arguments=arguments,
             media_refs=media_refs or [],
+            timeout_sec=timeout_sec,
             requires_rate_limit=requires_rate_limit,
         )
         t0 = time.monotonic()
@@ -624,7 +835,7 @@ class VcatOperationsService:
             target_ids = [t.id for t in db.scalars(select(PublishTarget).where(PublishTarget.account_id == acc.id))]
             if target_ids:
                 active_attempts = list(db.scalars(select(PublishAttempt).where(PublishAttempt.target_id.in_(target_ids))))
-                in_flight = [a for a in active_attempts if a.state in ("SUBMITTING", "ACCEPTED", "RECONCILING")]
+                in_flight = [a for a in active_attempts if a.state in ("SUBMITTING", "ACCEPTED", "PUBLISHING", "REVIEWING", "RECONCILING")]
                 if in_flight:
                     raise HTTPException(409, f"账号仍有 {len(in_flight)} 条正在提交或已受理的发布任务，请先等待完成或取消")
                 pending = [a for a in active_attempts if a.state in ("QUEUED", "WAITING_CLIENT_ONLINE")]
@@ -1109,7 +1320,7 @@ class VcatOperationsService:
             target = db.get(PublishTarget, att.target_id)
             acc = db.get(PlatformAccount, target.account_id)
             node = db.get(ExecutorNode, acc.node_id)
-            if att.state in ("SUBMITTING", "UNKNOWN", "PUBLISHED", "ACCEPTED", "DRAFT_PUSHED"):
+            if att.state in ("SUBMITTING", "UNKNOWN", "PUBLISHED", "ACCEPTED", "PUBLISHING", "REVIEWING", "DRAFT_PUSHED"):
                 db.commit()
                 return _attempt_dict(att, target, acc)
 
@@ -1147,11 +1358,21 @@ class VcatOperationsService:
                         a2.state = "DRAFT_PUSHED"
                         a2.vendor_draft_id = wres.media_id or f"manual-{a2.id[:8]}"
                         a2.error_message = None if wres.mode == "official_api" else "已登记为公众号草稿待人工后台群发（未配置公众号API密钥）"
+                        a2.verification_status = "confirmed_success"
+                        a2.verification_detail = (
+                            "已推送至公众号草稿箱，待人工后台群发并回填链接"
+                            if wres.mode == "official_api"
+                            else "已登记为公众号草稿待人工后台群发（未配置公众号API密钥）"
+                        )
+                        a2.last_verified_at = now()
                         t2.status = "DRAFT_PUSHED"
                     else:
                         a2.state = "RETRYABLE_FAILED"
                         a2.error_class = "WECHAT_DRAFT_ERROR"
                         a2.error_message = wres.error_message
+                        a2.verification_status = "confirmed_failed"
+                        a2.verification_detail = f"公众号草稿推送失败：{wres.error_message}"
+                        a2.last_verified_at = now()
                     a2.updated_at = now()
                     db2.commit()
                     return _attempt_dict(a2, t2, db2.get(PlatformAccount, t2.account_id))
@@ -1162,6 +1383,8 @@ class VcatOperationsService:
                 att.state = "WAITING_CLIENT_ONLINE"
                 att.error_class = "CLIENT_OFFLINE"
                 att.error_message = "操作者本机小V猫不在线，已挂起等待上线后一键继续"
+                att.verification_status = "confirmed_failed"
+                att.verification_detail = att.error_message
                 target.status = "WAITING_CLIENT_ONLINE"
                 db.commit()
                 return _attempt_dict(att, target, acc)
@@ -1212,8 +1435,11 @@ class VcatOperationsService:
             if tool_name == "vcat_create_draft":
                 args["draftTitle"] = f"{snap.get('title', '草稿')[:30]}-{target.id[:6]}"
             else:
-                args["batchName"] = f"acq-{target.schedule_id[:8]}"
+                batch_name = f"acq-{att.id[:8]}-{att.attempt_no}"
+                att.vendor_batch_name = batch_name
+                args["batchName"] = batch_name
                 args["start"] = True
+            attempt_no = att.attempt_no
             db.commit()
 
         _, res = self._execute_mcp(
@@ -1225,9 +1451,12 @@ class VcatOperationsService:
             arguments=args,
             media_refs=media_refs,
             requires_rate_limit=True,
-            action_id=f"attempt-{attempt_id}-{att.attempt_no}",
+            sync_wait_sec=45.0,
+            timeout_sec=120,
+            action_id=f"attempt-{attempt_id}-{attempt_no}",
         )
 
+        verify_kind: str | None = None
         with self.Session() as db:
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
             att = db.get(PublishAttempt, attempt_id)
@@ -1240,26 +1469,48 @@ class VcatOperationsService:
                 payload = res.payload if isinstance(res.payload, dict) else {}
                 if tool_name == "vcat_create_draft":
                     att.state = "DRAFT_PUSHED"
-                    att.vendor_draft_id = str(payload.get("draftId") or "")
+                    att.vendor_draft_id = str(payload.get("draftId") or payload.get("id") or "")
+                    att.verification_status = "verifying"
+                    att.verification_detail = "草稿已提交小V猫，正在回读草稿箱确认..."
                     target.status = "DRAFT_PUSHED"
+                    verify_kind = "draft"
                 else:
-                    att.vendor_local_id = str(payload.get("localId") or payload.get("id") or "")
-                    att.state = "PLATFORM_SCHEDULED" if target.schedule_owner == "platform" else "ACCEPTED"
+                    att.vendor_local_id = str(payload.get("localId") or payload.get("id") or payload.get("taskId") or "")
+                    att.state = "PLATFORM_SCHEDULED" if target.schedule_owner == "platform" else "PUBLISHING"
+                    att.verification_status = "verifying"
+                    att.verification_detail = "已提交小V猫，正在查询确认平台发布结果..."
                     target.status = att.state
+                    verify_kind = "publish"
             elif res.status == "NODE_OFFLINE":
                 att.state = "WAITING_CLIENT_ONLINE" if (node and node.node_scope == "client_local") else "RETRYABLE_FAILED"
                 att.error_class = "NODE_OFFLINE"
                 att.error_message = res.error_message
+                att.verification_status = "confirmed_failed"
+                att.verification_detail = res.error_message
+                target.status = att.state
             elif res.status in ("TIMEOUT", "UNKNOWN"):
                 att.state = "UNKNOWN"
                 att.error_class = res.status
-                att.error_message = res.error_message or "提交结果未知，请先核对任务列表，禁止直接重发"
+                att.error_message = res.error_message or "提交响应超时，结果未知，请先核对任务列表，禁止直接重发"
+                att.verification_status = "verifying"
+                att.verification_detail = "提交超时，系统将自动核对小V猫任务列表确认结果"
+                target.status = "UNKNOWN"
             else:
-                att.state = "RETRYABLE_FAILED" if tool_name == "vcat_create_draft" else "UNKNOWN"
-                att.error_class = "MCP_ERROR"
-                att.error_message = res.error_message
+                att.state = "REJECTED"
+                target.status = "REJECTED"
+                att.error_class = "DRAFT_REJECTED" if tool_name == "vcat_create_draft" else "PLATFORM_REJECTED"
+                att.error_message = res.error_message or "提交被平台或小V猫拒绝"
+                att.verification_status = "confirmed_failed"
+                att.last_verified_at = now()
+                att.verification_detail = f"提交失败：{att.error_message}"
             db.commit()
-            return _attempt_dict(att, target, acc)
+            result_dict = _attempt_dict(att, target, acc)
+
+        if verify_kind == "draft":
+            return self._verify_draft_attempt(attempt_id, actor=actor, raise_on_error=False)
+        if verify_kind == "publish":
+            return self._reconcile_publish_attempt_internal(attempt_id, actor=actor, raise_on_error=False)
+        return result_dict
 
     def list_attempts(self, actor: User, ip_id: str = "") -> list[dict[str, Any]]:
         with self.Session() as db:
@@ -1291,7 +1542,128 @@ class VcatOperationsService:
                 raise HTTPException(403, "无权查看该发布任务")
             return _attempt_dict(att, t, acc)
 
-    def reconcile_attempt(self, actor: User, attempt_id: str) -> dict[str, Any]:
+    def _verify_draft_attempt(
+        self,
+        attempt_id: str,
+        *,
+        actor: User | None = None,
+        raise_on_error: bool = False,
+    ) -> dict[str, Any]:
+        with self.Session() as db:
+            att = db.get(PublishAttempt, attempt_id)
+            if not att:
+                raise HTTPException(404, "草稿任务不存在")
+            target = db.get(PublishTarget, att.target_id)
+            acc = db.get(PlatformAccount, target.account_id)
+            node = db.get(ExecutorNode, acc.node_id)
+            if actor is not None and not self._can_access_account(db, actor, acc, node):
+                raise HTTPException(403, "没有此账号的操作权限")
+            if target.platform == "GongZhongHao":
+                return _attempt_dict(att, target, acc)
+            draft_id_str = str(att.vendor_draft_id or "").strip()
+            node_id = acc.node_id
+            account_id = acc.id
+
+        args: dict[str, Any] = {"draftId": int(draft_id_str)} if draft_id_str.isdigit() else {"page": 1, "pageSize": 50}
+        _, res = self._execute_mcp(
+            actor=actor,
+            node_id=node_id,
+            account_id=account_id,
+            action_type="verify_draft",
+            tool_name="vcat_list_drafts",
+            arguments=args,
+            requires_rate_limit=False,
+        )
+        if not res.ok:
+            if raise_on_error:
+                raise HTTPException(502, res.error_message or "回读小V猫草稿箱失败")
+            with self.Session() as db:
+                db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                att = db.get(PublishAttempt, attempt_id)
+                target = db.get(PublishTarget, att.target_id)
+                acc = db.get(PlatformAccount, target.account_id)
+                att.verification_status = "unverified"
+                att.last_verified_at = now()
+                att.verify_attempts = (att.verify_attempts or 0) + 1
+                att.verification_detail = f"草稿 #{draft_id_str or '-'} 已提交，但回读确认暂不可用（可点击核对状态重试）"
+                att.updated_at = now()
+                db.commit()
+                return _attempt_dict(att, target, acc)
+
+        matched: dict[str, Any] | None = None
+        payload = res.payload
+        if isinstance(payload, dict):
+            direct_id = payload.get("draftId") or payload.get("id")
+            if direct_id is not None and str(direct_id) == draft_id_str:
+                matched = payload
+            elif isinstance(payload.get("draft"), dict):
+                cand = payload["draft"]
+                cid = cand.get("draftId") or cand.get("id")
+                if cid is not None and str(cid) == draft_id_str:
+                    matched = cand
+            if matched is None:
+                items = payload.get("list") or payload.get("drafts") or []
+                if isinstance(items, list):
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        cid = item.get("draftId") or item.get("id")
+                        if draft_id_str and cid is not None and str(cid) == draft_id_str:
+                            matched = item
+                            break
+        elif isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                cid = item.get("draftId") or item.get("id")
+                if draft_id_str and cid is not None and str(cid) == draft_id_str:
+                    matched = item
+                    break
+
+        with self.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            att = db.get(PublishAttempt, attempt_id)
+            target = db.get(PublishTarget, att.target_id)
+            acc = db.get(PlatformAccount, target.account_id)
+            att.last_verified_at = now()
+            att.verify_attempts = (att.verify_attempts or 0) + 1
+            if matched:
+                err_text = _extract_remote_error(matched)
+                if err_text:
+                    att.state = "REJECTED"
+                    target.status = "REJECTED"
+                    att.remote_status = "draft_rejected"
+                    att.verification_status = "confirmed_failed"
+                    att.error_class = "DRAFT_REJECTED"
+                    att.error_message = err_text
+                    att.verification_detail = f"草稿校验失败：{err_text}"
+                else:
+                    att.state = "DRAFT_PUSHED"
+                    target.status = "DRAFT_PUSHED"
+                    att.remote_status = "draft_verified"
+                    att.verification_status = "confirmed_success"
+                    att.error_class = None
+                    att.error_message = None
+                    att.verification_detail = f"已回读确认草稿 #{draft_id_str} 已保存在小V猫草稿箱"
+            else:
+                att.state = "REJECTED"
+                target.status = "REJECTED"
+                att.remote_status = "draft_missing"
+                att.verification_status = "confirmed_failed"
+                att.error_class = "DRAFT_VERIFY_FAILED"
+                att.error_message = f"草稿 #{draft_id_str or '-'} 未在小V猫草稿箱中查到，可能推送失败，请检查内容或重试"
+                att.verification_detail = att.error_message
+            att.updated_at = now()
+            db.commit()
+            return _attempt_dict(att, target, acc)
+
+    def _reconcile_publish_attempt_internal(
+        self,
+        attempt_id: str,
+        *,
+        actor: User | None = None,
+        raise_on_error: bool = True,
+    ) -> dict[str, Any]:
         with self.Session() as db:
             att = db.get(PublishAttempt, attempt_id)
             if not att:
@@ -1299,52 +1671,297 @@ class VcatOperationsService:
             target = db.get(PublishTarget, att.target_id)
             acc = db.get(PlatformAccount, target.account_id)
             node = db.get(ExecutorNode, acc.node_id)
-            if not self._can_access_account(db, actor, acc, node):
+            if actor is not None and not self._can_access_account(db, actor, acc, node):
                 raise HTTPException(403, "没有此账号的操作权限")
+            if target.execution_mode == "draft" and att.vendor_draft_id and not att.vendor_local_id:
+                is_draft_only = True
+            else:
+                is_draft_only = False
             vendor_uid = acc.vendor_uid
             node_id = acc.node_id
-            local_id = att.vendor_local_id
+            account_id = acc.id
+
+        if is_draft_only:
+            return self._verify_draft_attempt(attempt_id, actor=actor, raise_on_error=raise_on_error)
 
         _, res = self._execute_mcp(
             actor=actor,
             node_id=node_id,
-            account_id=acc.id,
+            account_id=account_id,
             action_type="reconcile_publish",
             tool_name="vcat_list_publish_tasks",
-            arguments={"uid": vendor_uid, "page": 1, "pageSize": 20},
+            arguments={"uid": vendor_uid, "page": 1, "pageSize": 50},
             requires_rate_limit=False,
         )
         if not res.ok or not isinstance(res.payload, dict):
-            raise HTTPException(502, res.error_message or "查询小V猫发布任务列表失败")
-        tasks = res.payload.get("list") or []
-        matched = next((x for x in tasks if local_id and str(x.get("localId") or x.get("id")) == str(local_id)), None)
+            if raise_on_error:
+                raise HTTPException(502, res.error_message or "查询小V猫发布任务列表失败")
+            with self.Session() as db:
+                db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                att = db.get(PublishAttempt, attempt_id)
+                target = db.get(PublishTarget, att.target_id)
+                acc = db.get(PlatformAccount, target.account_id)
+                att.verification_status = "unverified"
+                att.last_verified_at = now()
+                att.verify_attempts = (att.verify_attempts or 0) + 1
+                att.verification_detail = f"暂无法连接执行节点核对状态：{res.error_message or '网络异常'}"
+                att.updated_at = now()
+                db.commit()
+                return _attempt_dict(att, target, acc)
 
+        tasks = res.payload.get("list") or res.payload.get("tasks") or res.payload.get("items") or []
         with self.Session() as db:
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
             att = db.get(PublishAttempt, attempt_id)
             target = db.get(PublishTarget, att.target_id)
             acc = db.get(PlatformAccount, target.account_id)
+            matched = _match_remote_publish_task(tasks if isinstance(tasks, list) else [], att, target)
             if matched:
-                st = str(matched.get("status") or matched.get("statusText") or "").lower()
-                post_id = matched.get("postId") or matched.get("workId")
-                url = matched.get("url") or matched.get("workUrl")
-                if post_id and ("success" in st or "published" in st or "成功" in st or "已发布" in st):
-                    att.state = "PUBLISHED"
-                    att.platform_post_id = str(post_id)
-                    att.evidence_url = str(url or "")
-                    target.status = "PUBLISHED"
-                elif "cancel" in st or "取消" in st:
-                    att.state = "CANCELLED"
-                    target.status = "CANCELLED"
-                elif "fail" in st or "reject" in st or "失败" in st:
-                    att.state = "REJECTED"
-                    att.error_message = str(matched.get("error") or matched.get("reason") or "平台执行失败")
-                    target.status = "REJECTED"
+                _apply_remote_publish_task(att, target, matched)
+            else:
+                att.last_verified_at = now()
+                att.verify_attempts = (att.verify_attempts or 0) + 1
+                if att.state in ("PUBLISHING", "ACCEPTED") and att.verify_attempts <= 3:
+                    att.verification_status = "verifying"
                 else:
-                    att.state = "ACCEPTED"
+                    att.verification_status = "unverified"
+                att.verification_detail = "暂未在小V猫发布任务列表中查到该任务，请稍后再次核对"
             att.updated_at = now()
             db.commit()
             return _attempt_dict(att, target, acc)
+
+    def reconcile_attempt(self, actor: User, attempt_id: str) -> dict[str, Any]:
+        return self._reconcile_publish_attempt_internal(attempt_id, actor=actor, raise_on_error=True)
+
+    def reconcile_active_attempts(
+        self,
+        actor: User | None = None,
+        *,
+        ip_id: str = "",
+        min_interval_sec: float = 2.0,
+        limit: int = 5,
+    ) -> dict[str, Any]:
+        with self.Session() as db:
+            if actor is not None and ip_id:
+                require_ip(db, actor, ip_id)
+            targets = {t.id: t for t in db.scalars(select(PublishTarget))}
+            accounts = {a.id: a for a in db.scalars(select(PlatformAccount))}
+            nodes = {n.id: n for n in db.scalars(select(ExecutorNode))}
+            candidates = list(
+                db.scalars(
+                    select(PublishAttempt)
+                    .where(
+                        PublishAttempt.state.in_(
+                            ("ACCEPTED", "PUBLISHING", "REVIEWING", "UNKNOWN", "PLATFORM_SCHEDULED")
+                        )
+                    )
+                    .order_by(PublishAttempt.updated_at.asc())
+                )
+            )
+            now_dt = datetime.now(timezone.utc)
+            picked_ids: list[str] = []
+            for att in candidates:
+                t = targets.get(att.target_id)
+                if not t or t.platform == "GongZhongHao":
+                    continue
+                if att.state == "PLATFORM_SCHEDULED" and (att.verification_status or "pending") not in ("pending", "verifying"):
+                    continue
+                if (att.verify_attempts or 0) >= 120:
+                    continue
+                if actor is not None and ip_id and t.ip_id != ip_id:
+                    continue
+                acc = accounts.get(t.account_id)
+                if actor is not None:
+                    allowed = (
+                        actor.role == "admin"
+                        or (t.ip_id and can_ip(db, actor, t.ip_id))
+                        or (acc and self._can_access_account(db, actor, acc, nodes.get(acc.node_id)))
+                    )
+                    if not allowed:
+                        continue
+                last_dt = _parse_iso(att.last_verified_at)
+                if last_dt is not None:
+                    wait_sec = (
+                        min_interval_sec
+                        if actor is not None
+                        else min(30.0, max(min_interval_sec, 3.0 * ((att.verify_attempts or 0) + 1)))
+                    )
+                    if (now_dt - last_dt).total_seconds() < wait_sec:
+                        continue
+                picked_ids.append(att.id)
+                if len(picked_ids) >= limit:
+                    break
+
+        reconciled = 0
+        for att_id in picked_ids:
+            try:
+                self._reconcile_publish_attempt_internal(att_id, actor=actor, raise_on_error=False)
+                reconciled += 1
+            except Exception:
+                pass
+        return {
+            "reconciled": reconciled,
+            "items": self.list_attempts(actor, ip_id=ip_id) if actor is not None else [],
+        }
+
+    def republish_attempt(
+        self,
+        actor: User,
+        attempt_id: str,
+        *,
+        mode: str | None = None,
+        schedule_owner: str | None = None,
+    ) -> dict[str, Any]:
+        if mode is not None and mode not in ("draft", "publish"):
+            raise HTTPException(422, "执行模式仅支持 draft 或 publish")
+        if schedule_owner is not None and schedule_owner not in ("server", "platform"):
+            raise HTTPException(422, "定时归属仅支持 server 或 platform")
+
+        with self.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            src = db.get(PublishAttempt, attempt_id)
+            if not src:
+                raise HTTPException(404, "发布任务不存在")
+            target = db.get(PublishTarget, src.target_id)
+            acc = db.get(PlatformAccount, target.account_id)
+            node = db.get(ExecutorNode, acc.node_id)
+            if not self._can_access_account(db, actor, acc, node):
+                raise HTTPException(403, "没有此账号的操作权限")
+            if not acc.active:
+                raise HTTPException(409, "目标平台账号已从小V猫移除")
+            if src.state not in ("REJECTED", "RETRYABLE_FAILED", "WAITING_CLIENT_ONLINE", "MISSED", "CANCELLED"):
+                raise HTTPException(409, f"当前状态 {src.state} 不允许再次发布（结果未知请先核对状态）")
+
+            draft = db.get(Record, target.draft_id)
+            if not draft or draft.kind != "drafts":
+                raise HTTPException(404, "关联稿件不存在")
+            cur_ver = int(draft.payload["version"])
+            err = self._validate_draft_ready(db, draft, cur_ver)
+            if err:
+                raise HTTPException(409, err)
+
+            old_snap = target.approved_snapshot_json or {}
+            video_asset: Record | None = None
+            cover_asset: Record | None = None
+            if target.platform != "GongZhongHao":
+                all_assets = list(
+                    db.scalars(
+                        select(Record)
+                        .where(Record.kind == "assets")
+                        .order_by(Record.created_at.desc())
+                    )
+                )
+                video_asset = next(
+                    (
+                        a
+                        for a in all_assets
+                        if a.payload.get("draft_id") == draft.id
+                        and a.payload.get("draft_version") == cur_ver
+                        and a.payload.get("type") == "video"
+                    ),
+                    None,
+                )
+                if not video_asset and old_snap.get("video_asset_id"):
+                    cand = db.get(Record, old_snap["video_asset_id"])
+                    if (
+                        cand
+                        and cand.kind == "assets"
+                        and cand.payload.get("type") == "video"
+                        and (self.app.state.data_dir / "assets" / cand.id).is_file()
+                    ):
+                        video_asset = cand
+                if not video_asset:
+                    raise HTTPException(409, "未找到可用视频资产，请先前往「拍摄上传」上传视频")
+
+                cover_asset = next(
+                    (
+                        a
+                        for a in all_assets
+                        if a.payload.get("draft_id") == draft.id
+                        and a.payload.get("draft_version") == cur_ver
+                        and a.payload.get("type") == "cover"
+                    ),
+                    None,
+                )
+                if not cover_asset and old_snap.get("cover_asset_id"):
+                    cand_cov = db.get(Record, old_snap["cover_asset_id"])
+                    if (
+                        cand_cov
+                        and cand_cov.kind == "assets"
+                        and cand_cov.payload.get("type") == "cover"
+                        and (self.app.state.data_dir / "assets" / cand_cov.id).is_file()
+                    ):
+                        cover_asset = cand_cov
+
+            next_mode = "draft" if target.platform == "GongZhongHao" else (mode or target.execution_mode)
+            next_owner = schedule_owner or target.schedule_owner
+            planned_utc = target.planned_at_utc
+            if next_owner == "server" and planned_utc < now():
+                planned_utc = now()
+            self._check_daily_limit(db, acc.id, planned_utc, exclude_attempt_id=src.id)
+
+            fresh_snapshot = {
+                "title": draft.payload.get("title", ""),
+                "desc": draft.payload.get("body", ""),
+                "video_asset_id": video_asset.id if video_asset else None,
+                "video_hash": video_asset.payload.get("hash") if video_asset else None,
+                "video_filename": video_asset.payload.get("filename") if video_asset else None,
+                "cover_asset_id": cover_asset.id if cover_asset else None,
+                "cover_hash": cover_asset.payload.get("hash") if cover_asset else None,
+                "cover_filename": cover_asset.payload.get("filename") if cover_asset else None,
+                "platform_options": old_snap.get("platform_options") or {},
+            }
+            fresh_hash = hashlib.sha256(
+                json.dumps(fresh_snapshot, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()
+
+            target.draft_version = cur_ver
+            target.approved_snapshot_json = fresh_snapshot
+            target.snapshot_hash = fresh_hash
+            target.execution_mode = next_mode
+            target.schedule_owner = next_owner
+            target.planned_at_utc = planned_utc
+            target.status = "QUEUED"
+            target.updated_at = now()
+
+            sched = db.get(Record, target.schedule_id)
+            if sched and sched.kind == "schedules":
+                sp = dict(sched.payload or {})
+                changed = (
+                    sp.get("status") == "needs_review"
+                    or sp.get("version") != cur_ver
+                    or sp.get("title") != draft.payload.get("title", "")
+                    or (video_asset and sp.get("asset_id") != video_asset.id)
+                )
+                if changed:
+                    if sp.get("status") == "needs_review":
+                        sp["status"] = "planned"
+                    sp["version"] = cur_ver
+                    sp["title"] = draft.payload.get("title", "")
+                    if video_asset:
+                        sp["asset_id"] = video_asset.id
+                    sched.payload = sp
+                    sched.updated_at = now()
+
+            max_no = max(
+                (a.attempt_no for a in db.scalars(select(PublishAttempt).where(PublishAttempt.target_id == target.id))),
+                default=src.attempt_no,
+            )
+            new_no = max_no + 1
+            new_att = PublishAttempt(
+                id=uid(),
+                target_id=target.id,
+                attempt_no=new_no,
+                idempotency_key=f"republish:{target.id}:{new_no}:{uid()[:8]}",
+                state="QUEUED",
+                node_id=acc.node_id,
+                verification_status="pending",
+            )
+            db.add(new_att)
+            db.commit()
+            new_att_id = new_att.id
+
+        return self.execute_attempt(new_att_id, actor=actor)
 
     def cancel_attempt(self, actor: User, attempt_id: str) -> dict[str, Any]:
         with self.Session() as db:
@@ -1501,14 +2118,19 @@ class VcatOperationsService:
             self._check_daily_limit(db, acc.id, planned_utc, exclude_attempt_id=attempt_id)
 
             max_no = max((a.attempt_no for a in db.scalars(select(PublishAttempt).where(PublishAttempt.target_id == target.id))), default=1)
+            promo_id = uid()
+            promo_no = max_no + 1
+            batch_name = f"acq-draft-{promo_id[:8]}-{promo_no}"
             promo = PublishAttempt(
-                id=uid(),
+                id=promo_id,
                 target_id=target.id,
-                attempt_no=max_no + 1,
+                attempt_no=promo_no,
                 idempotency_key=promo_key,
                 state="SUBMITTING",
                 node_id=acc.node_id,
                 vendor_draft_id=src.vendor_draft_id,
+                vendor_batch_name=batch_name,
+                verification_status="verifying",
                 submit_started_at=now(),
                 lease_until=(datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat(),
             )
@@ -1518,12 +2140,11 @@ class VcatOperationsService:
             target.status = "SUBMITTING"
             db.add(promo)
             db.commit()
-            promo_id = promo.id
             draft_id_arg: Any = int(src.vendor_draft_id) if str(src.vendor_draft_id).isdigit() else src.vendor_draft_id
             args: dict[str, Any] = {
                 "draftId": draft_id_arg,
                 "uid": acc.vendor_uid,
-                "batchName": f"acq-draft-{target.schedule_id[:8]}",
+                "batchName": batch_name,
                 "start": True,
             }
             if platform_options:
@@ -1539,9 +2160,12 @@ class VcatOperationsService:
             tool_name="vcat_publish_draft",
             arguments=args,
             requires_rate_limit=True,
+            sync_wait_sec=45.0,
+            timeout_sec=120,
             action_id=f"attempt-{promo_id}",
         )
 
+        should_verify = False
         with self.Session() as db:
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
             promo = db.get(PublishAttempt, promo_id)
@@ -1552,21 +2176,40 @@ class VcatOperationsService:
             promo.updated_at = now()
             if res.ok:
                 payload = res.payload if isinstance(res.payload, dict) else {}
-                promo.vendor_local_id = str(payload.get("localId") or payload.get("id") or "")
-                promo.state = "PLATFORM_SCHEDULED" if schedule_owner == "platform" else "ACCEPTED"
+                promo.vendor_local_id = str(payload.get("localId") or payload.get("id") or payload.get("taskId") or "")
+                promo.state = "PLATFORM_SCHEDULED" if schedule_owner == "platform" else "PUBLISHING"
+                promo.verification_status = "verifying"
+                promo.verification_detail = "草稿已转为发布任务，正在查询确认平台结果..."
                 target.status = promo.state
+                should_verify = True
             elif res.status == "NODE_OFFLINE":
                 promo.state = "WAITING_CLIENT_ONLINE" if (node and node.node_scope == "client_local") else "RETRYABLE_FAILED"
                 promo.error_class = "NODE_OFFLINE"
                 promo.error_message = res.error_message
+                promo.verification_status = "confirmed_failed"
+                promo.verification_detail = res.error_message
                 target.status = promo.state
-            else:
+            elif res.status in ("TIMEOUT", "UNKNOWN"):
                 promo.state = "UNKNOWN"
-                promo.error_class = res.status or "MCP_ERROR"
+                promo.error_class = res.status
                 promo.error_message = res.error_message or "草稿转正式发布状态未知，请核对任务列表"
+                promo.verification_status = "verifying"
+                promo.verification_detail = "草稿转正式发布超时，系统将自动核对小V猫任务列表确认结果"
                 target.status = "UNKNOWN"
+            else:
+                promo.state = "REJECTED"
+                target.status = "REJECTED"
+                promo.error_class = "PLATFORM_REJECTED"
+                promo.error_message = res.error_message or "草稿发布被拒绝"
+                promo.verification_status = "confirmed_failed"
+                promo.last_verified_at = now()
+                promo.verification_detail = f"草稿发布失败：{promo.error_message}"
             db.commit()
-            return _attempt_dict(promo, target, acc)
+            result_dict = _attempt_dict(promo, target, acc)
+
+        if should_verify:
+            return self._reconcile_publish_attempt_internal(promo_id, actor=actor, raise_on_error=False)
+        return result_dict
 
     # ---------- Posts, Stats, Comments, Messages, Monitors ----------
 

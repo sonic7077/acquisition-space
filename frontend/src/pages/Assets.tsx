@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Upload } from "lucide-react";
 import { uploadAsset, type Row } from "../api";
 import { Empty, Card, Field, Notice, getError } from "../components/ui";
@@ -7,17 +7,21 @@ import Teleprompter from "./Teleprompter";
 
 type UploadItem = { name: string; percent: number; status: string; error?: string };
 
-export default function Assets(c: Ctx) {
-  const drafts = filterIp(useRows("/drafts", c.version), c.ip).filter(
-      (d) => d.approved_version === d.version,
-    ),
+export default function Assets(c: Ctx & { initialDraftId?: string }) {
+  const allDrafts = filterIp(useRows("/drafts", c.version), c.ip),
+    drafts = allDrafts.filter((d) => d.approved_version === d.version),
     assets = filterIp(useRows("/assets", c.version), c.ip),
-    [target, setTarget] = useState(""),
+    [target, setTarget] = useState(c.initialDraftId || ""),
     [tele, setTele] = useState<Row | null>(null),
     [uploading, setUploading] = useState(false),
     [uploads, setUploads] = useState<UploadItem[]>([]);
+  useEffect(() => {
+    if (c.initialDraftId) setTarget(c.initialDraftId);
+  }, [c.initialDraftId]);
   const input = useRef<HTMLInputElement>(null);
   const selectedDraft = drafts.find((draft) => draft.id === target);
+  const targetedDraft = target ? allDrafts.find((draft) => draft.id === target) : null;
+  const unapprovedTarget = targetedDraft && targetedDraft.approved_version !== targetedDraft.version;
   async function upload(files: FileList | null) {
     if (!selectedDraft || !files?.length || uploading) return;
     const batch = Array.from(files);
@@ -94,6 +98,19 @@ export default function Assets(c: Ctx) {
           title="视频与封面投递箱"
           subtitle="选择已批准稿件，上传的文件将关联到该 IP 和批准版本"
         >
+          {unapprovedTarget && (
+            <Notice>
+              稿件「{targetedDraft.title}」当前版本（v{targetedDraft.version}）尚未批准，需批准后才能上传新版本视频。
+              <button
+                type="button"
+                className="text-button"
+                style={{ marginLeft: 8 }}
+                onClick={() => c.go("drafts", target)}
+              >
+                去审稿页批准该稿件
+              </button>
+            </Notice>
+          )}
           <Field label="明确关联稿件">
             <select value={selectedDraft?.id ?? ""} disabled={!drafts.length || uploading} onChange={(e) => setTarget(e.target.value)}>
               <option value="">{drafts.length ? "请选择已批准稿件" : "暂无可选稿件"}</option>

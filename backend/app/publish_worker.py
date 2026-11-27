@@ -56,6 +56,10 @@ def run_once(app) -> bool:
         service.execute_attempt(att_id, actor=None)
         worked = True
 
+    rec = service.reconcile_active_attempts(actor=None, min_interval_sec=5.0, limit=5)
+    if rec.get("reconciled", 0) > 0:
+        worked = True
+
     return worked
 
 
