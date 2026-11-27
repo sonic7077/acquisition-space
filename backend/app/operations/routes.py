@@ -6,11 +6,30 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .service import VcatOperationsService
+from .transport import RelayEventBus
 
 
 class PairCodeInput(BaseModel):
     node_scope: str = Field(default="client_local")
     label: str = Field(default="", max_length=60)
+
+
+class AgentDeployPlanInput(BaseModel):
+    os_key: str = Field(default="macos_arm64", max_length=32)
+    node_scope: str = Field(default="client_local")
+    label: str = Field(default="", max_length=60)
+    download_url: str | None = Field(default=None, max_length=1000)
+    server_url: str | None = Field(default=None, max_length=500)
+    poll_wait: float = Field(default=25.0, ge=0.0, le=30.0)
+
+
+class UpdateNodeInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class SwitchExecutorInput(BaseModel):
+    mode: str | None = None
+    default_node_id: str | None = None
 
 
 class BindAccountInput(BaseModel):
@@ -106,6 +125,8 @@ class DedupeAccountsInput(BaseModel):
 
 
 def register_operations(app, authenticated_user):
+    if not hasattr(app.state, "relay_bus"):
+        app.state.relay_bus = RelayEventBus()
     service = VcatOperationsService(app)
     app.state.ops_service = service
 
@@ -117,9 +138,22 @@ def register_operations(app, authenticated_user):
     def list_nodes(actor=Depends(actor_dep)):
         return service.list_nodes(actor)
 
+    @app.post("/api/ops/executor/switch")
+    def switch_executor(data: SwitchExecutorInput, actor=Depends(actor_dep)):
+        kwargs: dict[str, str | None] = {}
+        if "mode" in data.model_fields_set:
+            kwargs["mode"] = data.mode
+        if "default_node_id" in data.model_fields_set:
+            kwargs["default_node_id"] = data.default_node_id
+        return service.switch_executor(actor, **kwargs)
+
     @app.post("/api/ops/nodes/pair-code")
     def create_pair_code(data: PairCodeInput, actor=Depends(actor_dep)):
         return service.create_pair_code(actor, data.node_scope, data.label)
+
+    @app.patch("/api/ops/nodes/{node_id}")
+    def rename_node(node_id: str, data: UpdateNodeInput, actor=Depends(actor_dep)):
+        return service.rename_node(actor, node_id, data.name)
 
     @app.post("/api/ops/nodes/{node_id}/probe")
     def probe_node(node_id: str, actor=Depends(actor_dep)):
@@ -132,6 +166,44 @@ def register_operations(app, authenticated_user):
     @app.delete("/api/ops/nodes/{node_id}")
     def delete_node(node_id: str, actor=Depends(actor_dep)):
         return service.delete_node(actor, node_id)
+
+    @app.get("/api/ops/agent/deploy-config")
+    def get_agent_deploy_config(request: Request, actor=Depends(actor_dep)):
+        base_url = str(request.base_url).rstrip("/")
+        return service.get_agent_deploy_config(actor, base_url)
+
+    @app.post("/api/ops/agent/deploy-plan")
+    def create_agent_deploy_plan(data: AgentDeployPlanInput, request: Request, actor=Depends(actor_dep)):
+        base_url = (data.server_url or str(request.base_url)).rstrip("/")
+        return service.create_agent_deploy_plan(
+            actor,
+            os_key=data.os_key,
+            node_scope=data.node_scope,
+            label=data.label,
+            download_url=data.download_url,
+            server_url=base_url,
+            poll_wait=data.poll_wait,
+        )
+
+    @app.get("/api/ops/agent/package")
+    def download_agent_package(os: str = "macos_arm64"):
+        from .agent_installer import build_agent_package
+        try:
+            filename, media_type, content = build_agent_package(os)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/api/ops/agent/local-start")
+    def start_local_agent(actor=Depends(actor_dep)):
+        return service.try_local_agent_start(actor)
 
     @app.get("/api/ops/accounts")
     def list_accounts(ip_id: str = "", include_removed: bool = False, actor=Depends(actor_dep)):

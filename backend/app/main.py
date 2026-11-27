@@ -327,7 +327,7 @@ def create_app(data_dir=None):
             'collection': {'base_url', 'api_key', 'daily_budget', 'enabled'},
             'transcription': {'base_url', 'model', 'api_key'},
             'wechat': {'app_id', 'app_secret', 'webhook'},
-            'executor': {'mode', 'base_url', 'token', 'catchup_minutes', 'preflight_minutes', 'allow_client_local', 'allow_interaction_write'},
+            'executor': {'mode', 'base_url', 'token', 'catchup_minutes', 'preflight_minutes', 'allow_client_local', 'allow_interaction_write', 'default_node_id', 'agent_download_urls'},
             'rules': {'overlap_min', 'overlap_max'},
             'discovery': set(DEFAULT_RULES) - {'version'},
         }
@@ -346,6 +346,24 @@ def create_app(data_dir=None):
                     raise HTTPException(422, '飞书认证方式为app或cli')
                 if section == 'executor' and key == 'mode' and val not in ('manual', 'server_direct', 'server_relay', 'client_local', 'hybrid'):
                     raise HTTPException(422, '执行器模式无效')
+                if section == 'executor' and key == 'default_node_id':
+                    if val is not None and (not isinstance(val, str) or len(val.strip()) > 100):
+                        raise HTTPException(422, '默认执行节点标识无效')
+                    merged['default_node_id'] = val.strip() if isinstance(val, str) else ''
+                    continue
+                if section == 'executor' and key == 'agent_download_urls':
+                    from .operations.agent_installer import validate_download_urls
+                    try:
+                        cleaned_urls = validate_download_urls(val)
+                    except ValueError as exc:
+                        raise HTTPException(422, str(exc)) from None
+                    if not cleaned_urls:
+                        merged['agent_download_urls'] = {}
+                    else:
+                        prev_urls = dict(merged.get('agent_download_urls') or {})
+                        prev_urls.update(cleaned_urls)
+                        merged['agent_download_urls'] = {k: v for k, v in prev_urls.items() if v}
+                    continue
                 if key in ('enabled', 'allow_client_local', 'allow_interaction_write') and not isinstance(val, bool):
                     raise HTTPException(422, '启用开关必须是布尔值')
                 if key == 'daily_budget' and (not isinstance(val, (int, float)) or isinstance(val, bool) or not 1 <= val <= 100000):

@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { RefreshCw, Link2, ShieldCheck, QrCode, Trash2, Unlink, MessageSquarePlus } from "lucide-react";
 import { api, post, type Row } from "../../api";
 import { Badge, Card, Empty, Field, Modal, Notice } from "../../components/ui";
+import ExecutorNodesPanel from "../../components/ExecutorNodesPanel";
 import { type Ctx, filterIp } from "../../context";
 
 const PLATFORMS = [
@@ -268,65 +269,7 @@ export default function OpsAccounts(c: Ctx) {
         )}
       </Card>
 
-      {(nodesInfo?.nodes || []).length > 0 && (
-        <Card title={`已配对执行节点 · ${(nodesInfo?.nodes || []).length}`}>
-          <div className="table-scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>节点名称</th>
-                  <th>模式</th>
-                  <th>状态</th>
-                  <th>版本</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(nodesInfo?.nodes || []).map((n: Row) => (
-                  <tr key={n.id}>
-                    <td>{n.name}</td>
-                    <td>{n.node_scope}</td>
-                    <td>
-                      <Badge value={n.status} />
-                    </td>
-                    <td>{n.vcat_version || "—"}</td>
-                    <td>
-                      <div className="button-row">
-                        {n.id !== "server-direct-default" && n.status !== "revoked" && (
-                          <button
-                            className="text-button"
-                            onClick={() =>
-                              c.run(async () => {
-                                await post(`/ops/nodes/${n.id}/revoke`, {});
-                                load();
-                              }, "执行节点已吊销下线")
-                            }
-                          >
-                            吊销下线
-                          </button>
-                        )}
-                        {n.id !== "server-direct-default" && ["revoked", "offline"].includes(n.status) && (
-                          <button
-                            className="text-button"
-                            onClick={() =>
-                              c.run(async () => {
-                                await api(`/ops/nodes/${n.id}`, { method: "DELETE" });
-                                load();
-                              }, "离线节点已移除")
-                            }
-                          >
-                            移除节点
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Card>
-      )}
+      <ExecutorNodesPanel ctx={c} nodesInfo={nodesInfo} onChanged={setNodesInfo} />
 
       {loginModal && (
         <Modal title="Web 无感上号（内嵌官方登录助手）" onClose={() => setLoginModal(false)}>

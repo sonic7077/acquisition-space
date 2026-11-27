@@ -703,6 +703,329 @@ def test_p1_p2_closure_draft_promote_interactions_monitors_and_posts(tmp_path):
         mcp_srv.shutdown()
 
 
+def test_long_poll_immediate_wakeup_and_revoke_interrupt(tmp_path):
+    mcp_srv, mcp_url, mcp_state = start_mock_mcp_server()
+    try:
+        app, admin, member, ip, draft, vid, cov, sched = _setup_workspace(tmp_path)
+        assert admin.put("/api/settings", json={"executor": {"mode": "server_relay"}}).status_code == 200
+        pair = admin.post("/api/ops/nodes/pair-code", json={"node_scope": "server_relay", "label": "长轮询主机"}).json()
+        assert '--node-name "长轮询主机"' in pair["command_hint"]
+
+        agent_client = TestClient(app)
+        runner = VcatAgentRunner(
+            server_url="http://testserver",
+            mcp_url=mcp_url,
+            mcp_token="mock-mcp-token-secret",
+            state_dir=tmp_path / "lp_agent",
+            mode="server_managed",
+            min_interval_sec=0.0,
+            poll_wait=5.0,
+            server_http_client=agent_client,
+        )
+        reg = runner.register(pair["pair_code"], "长轮询主机")
+        nid = reg["node_id"]
+        hb = runner.heartbeat_once()
+        assert hb["ok"] is True
+
+        poll_result: dict[str, object] = {}
+
+        def _long_poll_worker():
+            c = TestClient(app)
+            t0 = time.monotonic()
+            resp = c.post(
+                "/internal/agents/poll",
+                params={"wait": 5.0},
+                headers={"Authorization": f"Bearer {runner.node_secret}"},
+                json={},
+            )
+            poll_result["elapsed"] = time.monotonic() - t0
+            poll_result["status_code"] = resp.status_code
+            cmd = resp.json().get("command")
+            poll_result["command"] = cmd
+            if cmd:
+                c.post(
+                    f"/internal/agents/commands/{cmd['action_id']}/result",
+                    headers={"Authorization": f"Bearer {runner.node_secret}"},
+                    json={"ok": True, "status": "SUCCEEDED", "payload": {"list": mcp_state.accounts}},
+                )
+
+        th = threading.Thread(target=_long_poll_worker, daemon=True)
+        th.start()
+
+        # Wait until long-poll connection is tracked as active
+        seen_active = False
+        for _ in range(30):
+            nodes_data = admin.get("/api/ops/nodes").json()
+            target_node = next(n for n in nodes_data["nodes"] if n["id"] == nid)
+            if target_node["active_poll"] and target_node["channel"] == "long_poll":
+                seen_active = True
+                break
+            time.sleep(0.05)
+        assert seen_active is True
+
+        t_sync = time.monotonic()
+        sync = admin.post("/api/ops/accounts/sync", json={})
+        sync_elapsed = time.monotonic() - t_sync
+        th.join(timeout=2.0)
+
+        assert sync.status_code == 200, sync.text
+        assert sync.json()["synced"] == 3
+        assert sync_elapsed < 1.5
+        assert poll_result["status_code"] == 200
+        assert poll_result["command"] is not None
+        assert float(poll_result["elapsed"]) < 1.5
+
+        # Revoking node immediately wakes suspended long-poll and returns 401
+        revoke_result: dict[str, object] = {}
+
+        def _revoke_waiter():
+            c = TestClient(app)
+            t0 = time.monotonic()
+            resp = c.post(
+                "/internal/agents/poll",
+                params={"wait": 5.0},
+                headers={"Authorization": f"Bearer {runner.node_secret}"},
+                json={},
+            )
+            revoke_result["elapsed"] = time.monotonic() - t0
+            revoke_result["status_code"] = resp.status_code
+
+        th2 = threading.Thread(target=_revoke_waiter, daemon=True)
+        th2.start()
+        for _ in range(30):
+            nodes_data = admin.get("/api/ops/nodes").json()
+            target_node = next(n for n in nodes_data["nodes"] if n["id"] == nid)
+            if target_node["active_poll"]:
+                break
+            time.sleep(0.05)
+
+        assert admin.post(f"/api/ops/nodes/{nid}/revoke").status_code == 200
+        th2.join(timeout=2.0)
+        assert revoke_result["status_code"] == 401
+        assert float(revoke_result["elapsed"]) < 1.5
+    finally:
+        mcp_srv.shutdown()
+
+
+def test_multi_agent_rename_default_node_and_local_fallback_switch(tmp_path):
+    mcp_srv, mcp_url, mcp_state = start_mock_mcp_server()
+    try:
+        app, admin, member, ip, draft, vid, cov, sched = _setup_workspace(tmp_path)
+        assert (
+            admin.put(
+                "/api/settings",
+                json={"executor": {"mode": "server_relay", "base_url": mcp_url, "token": "mock-mcp-token-secret"}},
+            ).status_code
+            == 200
+        )
+
+        pair_a = admin.post("/api/ops/nodes/pair-code", json={"node_scope": "server_relay", "label": "客厅迷你机"}).json()
+        pair_b = admin.post("/api/ops/nodes/pair-code", json={"node_scope": "server_relay", "label": "办公室Win11"}).json()
+
+        runner_a = VcatAgentRunner(
+            server_url="http://testserver",
+            mcp_url=mcp_url,
+            mcp_token="mock-mcp-token-secret",
+            state_dir=tmp_path / "agent_a",
+            mode="server_managed",
+            min_interval_sec=0.0,
+            poll_wait=0.0,
+            server_http_client=TestClient(app),
+        )
+        runner_b = VcatAgentRunner(
+            server_url="http://testserver",
+            mcp_url=mcp_url,
+            mcp_token="mock-mcp-token-secret",
+            state_dir=tmp_path / "agent_b",
+            mode="server_managed",
+            min_interval_sec=0.0,
+            poll_wait=0.0,
+            server_http_client=TestClient(app),
+        )
+        nid_a = runner_a.register(pair_a["pair_code"], "客厅迷你机")["node_id"]
+        nid_b = runner_b.register(pair_b["pair_code"], "办公室Win11")["node_id"]
+        runner_b.heartbeat_once()
+        runner_a.heartbeat_once()  # node A has newer heartbeat
+
+        # Rename node A; member cannot rename server_relay nodes or switch executor
+        assert member.patch(f"/api/ops/nodes/{nid_a}", json={"name": "越权改名"}).status_code == 403
+        assert member.post("/api/ops/executor/switch", json={"mode": "server_direct"}).status_code == 403
+        renamed = admin.patch(f"/api/ops/nodes/{nid_a}", json={"name": "客厅主机-已改名"})
+        assert renamed.status_code == 200 and renamed.json()["name"] == "客厅主机-已改名"
+
+        # Select node B explicitly as default_node_id even though node A heartbeated more recently
+        switched = admin.post("/api/ops/executor/switch", json={"mode": "server_relay", "default_node_id": nid_b})
+        assert switched.status_code == 200
+        sdata = switched.json()
+        assert sdata["mode"] == "server_relay"
+        assert sdata["default_node_id"] == nid_b
+        assert sdata["local_fallback_ready"] is True
+        node_map = {n["id"]: n for n in sdata["nodes"]}
+        assert node_map[nid_b]["is_default"] is True
+        assert node_map[nid_a]["is_default"] is False
+        assert node_map["server-direct-default"]["channel"] == "direct_http"
+
+        # When agent B polls, sync routes specifically to default node B (not node A)
+        stop_flag = threading.Event()
+
+        def _poll_b():
+            while not stop_flag.is_set():
+                if runner_b.poll_once():
+                    break
+                time.sleep(0.05)
+
+        tb = threading.Thread(target=_poll_b, daemon=True)
+        tb.start()
+        try:
+            sync_b = admin.post("/api/ops/accounts/sync", json={})
+        finally:
+            stop_flag.set()
+            tb.join(timeout=2.0)
+
+        assert sync_b.status_code == 200
+        synced_node_ids_b = {a["node_id"] for a in sync_b.json()["accounts"]}
+        assert nid_b in synced_node_ids_b
+        assert nid_a not in synced_node_ids_b
+        assert runner_a.poll_once() is False
+
+        # Quick-switch back to server_direct local fallback mode and verify direct execution works
+        fallback = admin.post("/api/ops/executor/switch", json={"mode": "server_direct"})
+        assert fallback.status_code == 200
+        assert fallback.json()["mode"] == "server_direct"
+        sync_direct = admin.post("/api/ops/accounts/sync", json={})
+        assert sync_direct.status_code == 200
+        assert any(a["node_id"] == "server-direct-default" for a in sync_direct.json()["accounts"])
+    finally:
+        mcp_srv.shutdown()
+
+
+def test_agent_deploy_config_custom_urls_packages_and_plan(tmp_path):
+    import io
+    import tarfile
+    import zipfile
+
+    app, admin, member, ip, draft, vid, cov, sched = _setup_workspace(tmp_path)
+
+    cfg = admin.get("/api/ops/agent/deploy-config")
+    assert cfg.status_code == 200
+    cdata = cfg.json()
+    assert set(cdata["supported_os"].keys()) == {"macos_arm64", "macos_x64", "windows_x64", "linux_x64"}
+    assert cdata["default_urls"]["macos_arm64"].endswith("/api/ops/agent/package?os=macos_arm64")
+    assert len(cdata["keepalive_summary"]) >= 4
+
+    # Invalid download URL blocked 422
+    bad_upd = admin.put(
+        "/api/settings",
+        json={"executor": {"agent_download_urls": {"macos_arm64": "ftp://invalid.example.com/pkg.tar.gz"}}},
+    )
+    assert bad_upd.status_code == 422
+
+    # Valid custom download URLs saved & reflected in deploy-config effective_urls
+    custom_mac = "https://mirrors.example.com/acq/vcat-macos-arm64.tar.gz"
+    custom_win = "https://mirrors.example.com/acq/vcat-win64.zip"
+    good_upd = admin.put(
+        "/api/settings",
+        json={"executor": {"agent_download_urls": {"macos_arm64": custom_mac, "windows_x64": custom_win}}},
+    )
+    assert good_upd.status_code == 200
+    cfg2 = admin.get("/api/ops/agent/deploy-config").json()
+    assert cfg2["effective_urls"]["macos_arm64"] == custom_mac
+    assert cfg2["effective_urls"]["windows_x64"] == custom_win
+    assert cfg2["effective_urls"]["linux_x64"].endswith("/api/ops/agent/package?os=linux_x64")
+
+    # Package endpoint builds safe archives with daemon scripts & env setup
+    mac_pkg = admin.get("/api/ops/agent/package?os=macos_arm64")
+    assert mac_pkg.status_code == 200
+    with tarfile.open(fileobj=io.BytesIO(mac_pkg.content), mode="r:gz") as tf:
+        names = set(tf.getnames())
+        assert {"vcat_agent.py", "requirements.txt", "start-agent.sh", "install-daemon.sh"} <= names
+        assert ".env" not in names and "vcat_agent.env" not in names
+        daemon_sh = tf.extractfile("install-daemon.sh").read().decode("utf-8")
+        assert "KeepAlive" in daemon_sh and "ACQ_VCAT_AGENT_BIN" in daemon_sh
+
+    win_pkg = admin.get("/api/ops/agent/package?os=windows_x64")
+    assert win_pkg.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(win_pkg.content), "r") as zf:
+        wnames = set(zf.namelist())
+        assert {"vcat_agent.py", "requirements.txt", "start-agent.cmd", "install-daemon.ps1"} <= wnames
+        ps1 = zf.read("install-daemon.ps1").decode("utf-8")
+        assert "SetEnvironmentVariable" in ps1 and "AcquisitionVcatAgent" in ps1
+
+    # Member cannot generate server_relay plan, can generate client_local plan
+    assert (
+        member.post(
+            "/api/ops/agent/deploy-plan",
+            json={"os_key": "macos_arm64", "node_scope": "server_relay", "label": "越权节点"},
+        ).status_code
+        == 403
+    )
+
+    plan = member.post(
+        "/api/ops/agent/deploy-plan",
+        json={
+            "os_key": "windows_x64",
+            "node_scope": "client_local",
+            "label": "小王Win11",
+            "server_url": "https://acq.example.com",
+        },
+    )
+    assert plan.status_code == 200, plan.text
+    pdata = plan.json()
+    assert pdata["download_url"] == custom_win
+    assert pdata["script_filename"] == "install-vcat-agent-windows_x64.ps1"
+    assert custom_win in pdata["script_content"]
+    assert pdata["pair_code"] in pdata["script_content"]
+    assert "--register-only" in pdata["script_content"]
+    assert "install-daemon.ps1" in pdata["script_content"]
+    assert "ACQ_VCAT_AGENT_BIN" in pdata["script_content"]
+
+    # Reset custom URLs back to default
+    assert admin.put("/api/settings", json={"executor": {"agent_download_urls": {}}}).status_code == 200
+    cfg3 = admin.get("/api/ops/agent/deploy-config").json()
+    assert cfg3["effective_urls"]["macos_arm64"] == cfg3["default_urls"]["macos_arm64"]
+
+
+def test_agent_env_persist_instance_lock_and_cache_gc(tmp_path, monkeypatch):
+    import os
+    from executor.vcat_agent import acquire_instance_lock, cleanup_media_cache, persist_agent_env
+
+    monkeypatch.setenv("ACQ_SKIP_USER_ENV", "1")
+    state_dir = tmp_path / "agent_state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    env_file = state_dir / "vcat_agent.env"
+    env_file.write_text("VCAT_MCP_TOKEN=keep-secret-token\n", encoding="utf-8")
+
+    persisted = persist_agent_env(state_dir, "https://cloud.example.com/", sync_user_env=True)
+    assert persisted["VCAT_SERVER_URL"] == "https://cloud.example.com"
+    assert "ACQ_VCAT_AGENT_HOME" in persisted and "ACQ_VCAT_AGENT_BIN" in persisted
+    text = env_file.read_text(encoding="utf-8")
+    assert "VCAT_MCP_TOKEN=keep-secret-token" in text
+    assert f"ACQ_VCAT_AGENT_HOME={persisted['ACQ_VCAT_AGENT_HOME']}" in text
+
+    # Single-instance lock prevents duplicate agent startup
+    fh = acquire_instance_lock(state_dir)
+    try:
+        with pytest.raises(RuntimeError):
+            acquire_instance_lock(state_dir)
+    finally:
+        fh.close()
+    fh2 = acquire_instance_lock(state_dir)
+    fh2.close()
+
+    # Media cache GC cleans files older than TTL and keeps fresh files
+    cache_dir = state_dir / "media_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    old_file = cache_dir / "old_video.mp4"
+    new_file = cache_dir / "new_video.mp4"
+    old_file.write_bytes(b"old")
+    new_file.write_bytes(b"new")
+    old_ts = time.time() - 10 * 86400
+    os.utime(old_file, (old_ts, old_ts))
+    removed = cleanup_media_cache(cache_dir, ttl_days=7.0)
+    assert removed == 1
+    assert not old_file.exists() and new_file.exists()
+
+
 def test_publish_verification_failure_feedback_and_republish_lifecycle(tmp_path):
     mcp_srv, mcp_url, mcp_state = start_mock_mcp_server()
     try:

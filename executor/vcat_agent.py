@@ -12,8 +12,13 @@ from datetime import datetime, timezone
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import platform
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -120,6 +125,7 @@ class VcatAgentRunner:
         node_secret: str = "",
         node_id: str = "",
         min_interval_sec: float = 3.2,
+        poll_wait: float | None = None,
         server_http_client: httpx.Client | None = None,
         mcp_http_client: httpx.Client | None = None,
     ) -> None:
@@ -136,6 +142,7 @@ class VcatAgentRunner:
         self.node_secret = node_secret
         self.node_id = node_id
         self.min_interval_sec = min_interval_sec
+        self.poll_wait = (0.0 if server_http_client is not None else 25.0) if poll_wait is None else max(0.0, float(poll_wait))
         self._last_mcp_ts = 0.0
         self._mcp_session_id: str | None = None
         self._req_id = 0
@@ -151,11 +158,18 @@ class VcatAgentRunner:
     def _srv_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.node_secret}"}
 
-    def _post_server(self, path: str, json_body: dict[str, Any]) -> httpx.Response:
+    def _post_server(
+        self,
+        path: str,
+        json_body: dict[str, Any],
+        *,
+        params: dict[str, Any] | None = None,
+        timeout: float = 20.0,
+    ) -> httpx.Response:
         if self._server_client is not None:
-            return self._server_client.post(path, headers=self._srv_headers(), json=json_body)
-        with httpx.Client(base_url=self.server_url, timeout=20, follow_redirects=False, trust_env=False) as c:
-            return c.post(path, headers=self._srv_headers(), json=json_body)
+            return self._server_client.post(path, headers=self._srv_headers(), json=json_body, params=params)
+        with httpx.Client(base_url=self.server_url, timeout=timeout, follow_redirects=False, trust_env=False) as c:
+            return c.post(path, headers=self._srv_headers(), json=json_body, params=params)
 
     def _get_server(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
         if self._server_client is not None:
@@ -232,6 +246,13 @@ class VcatAgentRunner:
 
     def heartbeat_once(self) -> dict[str, Any]:
         ready, caps = self.probe_local_mcp()
+        caps = {
+            **caps,
+            "channel": "long_poll" if self.poll_wait > 0 else "short_poll",
+            "os_platform": platform.system().lower(),
+            "pid": os.getpid(),
+            "agent_home": str(Path(__file__).resolve().parent),
+        }
         resp = self._post_server(
             "/internal/agents/heartbeat",
             {
@@ -278,7 +299,15 @@ class VcatAgentRunner:
         return mapping
 
     def poll_once(self) -> bool:
-        resp = self._post_server("/internal/agents/poll", {})
+        if self.poll_wait > 0:
+            resp = self._post_server(
+                "/internal/agents/poll",
+                {},
+                params={"wait": self.poll_wait},
+                timeout=max(30.0, self.poll_wait + 15.0),
+            )
+        else:
+            resp = self._post_server("/internal/agents/poll", {})
         resp.raise_for_status()
         cmd = resp.json().get("command")
         if not cmd:
@@ -393,6 +422,160 @@ def _load_env_file(path: Path) -> None:
             os.environ.setdefault(key, val)
 
 
+def persist_agent_env(state_dir: Path, server_url: str, *, sync_user_env: bool = True) -> dict[str, str]:
+    """Persist self binary/home paths & server URL into state env file and user OS env."""
+    state_dir = Path(state_dir).expanduser().resolve()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    agent_home = str(Path(__file__).resolve().parent)
+    is_win = platform.system().lower().startswith("win")
+    default_bin = state_dir / ("start-agent.cmd" if is_win else "start-agent.sh")
+    agent_bin = str(default_bin.resolve() if default_bin.exists() else Path(__file__).resolve())
+    python_bin = str(Path(sys.executable).resolve())
+    clean_server = server_url.strip().rstrip("/")
+
+    updates = {
+        "VCAT_STATE_DIR": str(state_dir),
+        "ACQ_VCAT_AGENT_HOME": agent_home,
+        "ACQ_VCAT_AGENT_BIN": agent_bin,
+        "ACQ_VCAT_AGENT_PYTHON": python_bin,
+    }
+    if clean_server:
+        updates["VCAT_SERVER_URL"] = clean_server
+
+    env_path = state_dir / "vcat_agent.env"
+    existing_lines: list[str] = []
+    seen: set[str] = set()
+    if env_path.is_file():
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                k = stripped.split("=", 1)[0].strip()
+                if k in updates:
+                    existing_lines.append(f"{k}={updates[k]}")
+                    seen.add(k)
+                    continue
+            existing_lines.append(raw_line)
+    for k, v in updates.items():
+        if k not in seen:
+            existing_lines.append(f"{k}={v}")
+    env_path.write_text("\n".join(existing_lines).rstrip() + "\n", encoding="utf-8")
+    try:
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
+
+    for k, v in updates.items():
+        os.environ[k] = v
+
+    if sync_user_env and os.environ.get("ACQ_SKIP_USER_ENV") != "1":
+        if is_win:
+            for k in ("ACQ_VCAT_AGENT_HOME", "ACQ_VCAT_AGENT_BIN", "ACQ_VCAT_AGENT_PYTHON", "VCAT_SERVER_URL"):
+                if k in updates:
+                    try:
+                        subprocess.run(["setx", k, updates[k]], check=False, capture_output=True)
+                    except Exception:
+                        pass
+        else:
+            sys_name = platform.system().lower()
+            rc_path = Path.home() / (".zshrc" if sys_name == "darwin" else ".bashrc")
+            try:
+                text = rc_path.read_text(encoding="utf-8") if rc_path.is_file() else ""
+                block = "\n".join(
+                    [
+                        "# >>> acquisition-vcat-agent env >>>",
+                        f'export ACQ_VCAT_AGENT_HOME="{agent_home}"',
+                        f'export ACQ_VCAT_AGENT_BIN="{agent_bin}"',
+                        f'export ACQ_VCAT_AGENT_PYTHON="{python_bin}"',
+                        f'export VCAT_SERVER_URL="{updates.get("VCAT_SERVER_URL", "")}"',
+                        "# <<< acquisition-vcat-agent env <<<",
+                    ]
+                )
+                pattern = re.compile(
+                    r"# >>> acquisition-vcat-agent env >>>.*?# <<< acquisition-vcat-agent env <<<\n?",
+                    re.S,
+                )
+                cleaned = pattern.sub("", text).rstrip()
+                rc_path.write_text((cleaned + "\n\n" + block + "\n") if cleaned else (block + "\n"), encoding="utf-8")
+            except Exception:
+                pass
+            if sys_name == "darwin":
+                for k in ("ACQ_VCAT_AGENT_HOME", "ACQ_VCAT_AGENT_BIN", "ACQ_VCAT_AGENT_PYTHON", "VCAT_SERVER_URL"):
+                    if k in updates:
+                        try:
+                            subprocess.run(["launchctl", "setenv", k, updates[k]], check=False, capture_output=True)
+                        except Exception:
+                            pass
+    return updates
+
+
+def acquire_instance_lock(state_dir: Path):
+    """Ensure only one active vcat_agent daemon runs per state directory."""
+    state_dir = Path(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "agent.lock"
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt  # type: ignore
+
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        fh.close()
+        raise RuntimeError(f"检测到同一目录下已有运行中的 vcat_agent 实例 ({lock_path})") from exc
+    fh.seek(0)
+    fh.truncate()
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+def cleanup_media_cache(cache_dir: Path, ttl_days: float = 7.0) -> int:
+    """Delete staged media files older than ttl_days to avoid disk exhaustion."""
+    cache_dir = Path(cache_dir)
+    if ttl_days <= 0 or not cache_dir.is_dir():
+        return 0
+    cutoff = time.time() - ttl_days * 86400.0
+    removed = 0
+    for item in cache_dir.iterdir():
+        if not item.is_file():
+            continue
+        try:
+            if item.stat().st_mtime < cutoff:
+                item.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _configure_logger(state_dir: Path) -> logging.Logger:
+    logs_dir = Path(state_dir) / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("vcat_agent")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = RotatingFileHandler(logs_dir / "vcat_agent.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        logger.addHandler(handler)
+    return logger
+
+
+def _start_watchdog(last_tick_ref: list[float], timeout_sec: float, logger: logging.Logger) -> None:
+    def _watch() -> None:
+        while True:
+            time.sleep(15.0)
+            if time.monotonic() - last_tick_ref[0] > timeout_sec:
+                logger.error("主循环超过 %.0fs 未响应，触发自愈退出交由系统守护重启", timeout_sec)
+                os._exit(1)
+
+    t = threading.Thread(target=_watch, daemon=True, name="agent-watchdog")
+    t.start()
+
+
 def main() -> int:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--env-file", default="")
@@ -417,7 +600,9 @@ def main() -> int:
     parser.add_argument("--mcp-url", default=os.environ.get("VCAT_MCP_URL", "http://127.0.0.1:3199/mcp"))
     parser.add_argument("--mcp-token", default=os.environ.get("VCAT_MCP_TOKEN", ""))
     parser.add_argument("--pair-token", default="")
-    parser.add_argument("--node-name", default="")
+    parser.add_argument("--register-only", action="store_true", help="Register credentials, persist env, and exit")
+    parser.add_argument("--node-name", default=os.environ.get("VCAT_NODE_NAME", ""))
+    parser.add_argument("--poll-wait", type=float, default=float(os.environ.get("VCAT_POLL_WAIT", "25")))
     parser.add_argument(
         "--state-dir",
         default=str(Path(os.environ.get("VCAT_STATE_DIR", str(Path.home() / ".acquisition-vcat-agent"))).expanduser()),
@@ -427,7 +612,11 @@ def main() -> int:
     if not args.server:
         print("请通过 --server 或环境变量 VCAT_SERVER_URL 提供获客空间服务地址", file=sys.stderr)
         return 2
-    if not args.mcp_token:
+
+    state_dir = Path(args.state_dir).expanduser()
+    persist_agent_env(state_dir, args.server, sync_user_env=True)
+
+    if not args.mcp_token and not (args.register_only and args.pair_token):
         print("请通过 --mcp-token 或环境变量 VCAT_MCP_TOKEN 提供本机小V猫 MCP 令牌", file=sys.stderr)
         return 2
 
@@ -435,37 +624,70 @@ def main() -> int:
         server_url=args.server,
         mcp_url=args.mcp_url,
         mcp_token=args.mcp_token,
-        state_dir=Path(args.state_dir),
+        state_dir=state_dir,
         mode=args.mode,
+        poll_wait=args.poll_wait,
     )
     if args.pair_token:
         runner.register(args.pair_token, args.node_name or f"{args.mode}-node")
+    if args.register_only:
+        return 0
     if not runner.node_secret:
         print("未检测到节点凭据，请传入 --pair-token 完成首次配对", file=sys.stderr)
         return 2
 
+    try:
+        lock_fh = acquire_instance_lock(state_dir)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    logger = _configure_logger(state_dir)
+    ttl_days = float(os.environ.get("VCAT_MEDIA_CACHE_TTL_DAYS", "7"))
+    cleanup_media_cache(runner.cache_dir, ttl_days=ttl_days)
+
     parsed_srv = urlparse(args.server)
     allowed_origin = f"{parsed_srv.scheme}://{parsed_srv.netloc}" if parsed_srv.scheme and parsed_srv.netloc else ""
-    health_srv = _start_local_health_server(runner, allowed_origin) if args.mode == "client_local" else None
+    health_srv = _start_local_health_server(runner, allowed_origin)
     last_hb = 0.0
+    last_cache_gc = time.monotonic()
+    last_tick = [time.monotonic()]
+    _start_watchdog(last_tick, max(120.0, float(args.poll_wait) * 3.0), logger)
+    fail_streak = 0
     try:
         while True:
+            last_tick[0] = time.monotonic()
+            if time.monotonic() - last_cache_gc >= 21600:
+                cleanup_media_cache(runner.cache_dir, ttl_days=ttl_days)
+                last_cache_gc = time.monotonic()
             if time.monotonic() - last_hb >= 15:
                 try:
                     runner.heartbeat_once()
                     last_hb = time.monotonic()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("心跳上报异常: %s", exc)
             try:
                 worked = runner.poll_once()
-            except Exception:
+                fail_streak = 0
+            except Exception as exc:
+                logger.warning("指令轮询异常: %s", exc)
                 worked = False
-            time.sleep(0.5 if worked else 2.0)
+                fail_streak += 1
+            if fail_streak > 0:
+                time.sleep(min(10.0, float(2 ** min(fail_streak - 1, 3))))
+            elif runner.poll_wait > 0:
+                time.sleep(0.05)
+            else:
+                time.sleep(0.5 if worked else 2.0)
     except KeyboardInterrupt:
         pass
     finally:
         if health_srv:
             health_srv.shutdown()
+        try:
+            lock_fh.close()
+        except Exception:
+            pass
     return 0
 
 

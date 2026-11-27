@@ -25,7 +25,13 @@ import {
 } from "lucide-react";
 import { api, post, type Row } from "./api";
 
-import { ROLE, Empty, Card } from "./components/ui";
+import { ROLE, Empty, Card, Badge } from "./components/ui";
+import ExecutorNodesPanel, {
+  EXECUTOR_MODES,
+  channelLabel,
+  formatHeartbeatAge,
+} from "./components/ExecutorNodesPanel";
+import AgentDeployModal from "./components/AgentDeployModal";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
 import Knowledge from "./pages/Knowledge";
@@ -112,7 +118,10 @@ export default function App() {
     [version, setVersion] = useState(0),
     [error, setError] = useState(""),
     [toast, setToast] = useState(""),
-    [collapsed, setCollapsed] = useState(false);
+    [collapsed, setCollapsed] = useState(false),
+    [execInfo, setExecInfo] = useState<Row | null>(null),
+    [execOpen, setExecOpen] = useState(false),
+    [deployOpen, setDeployOpen] = useState(false);
   const refresh = () => setVersion((v) => v + 1);
   const notify = (s: string) => {
     setToast(s);
@@ -141,6 +150,23 @@ export default function App() {
       api("/ips")
         .then(setIps)
         .catch((e) => setError(getError(e)));
+  }, [me, version]);
+  useEffect(() => {
+    if (!me) {
+      setExecInfo(null);
+      setExecOpen(false);
+      return;
+    }
+    const fetchExec = () => {
+      api<Row>("/ops/nodes").then(setExecInfo).catch(() => {});
+    };
+    fetchExec();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        fetchExec();
+      }
+    }, 4000);
+    return () => window.clearInterval(timer);
   }, [me, version]);
   useEffect(() => {
     const cb = () => {
@@ -238,6 +264,162 @@ export default function App() {
             <strong>{title}</strong>
           </div>
           <div className="header-right">
+            {(() => {
+              const execNodes: Row[] = execInfo?.nodes || [];
+              const onlineCount = execNodes.filter((n) => n.status === "online").length;
+              const runningCount = execNodes.reduce(
+                (sum, n) => sum + Number(n.queued_commands || 0) + Number(n.running_commands || 0),
+                0,
+              );
+              const modeKey = execInfo?.mode || "manual";
+              const dotTone =
+                onlineCount > 0 ? "online" : modeKey === "manual" ? "idle" : "offline";
+              return (
+                <div className="exec-status-wrap">
+                  <button
+                    type="button"
+                    className="exec-pill"
+                    aria-label="执行器实时状态"
+                    aria-expanded={execOpen}
+                    onClick={() => setExecOpen((v) => !v)}
+                  >
+                    <span className={`exec-dot ${dotTone}`} />
+                    <span>{EXECUTOR_MODES[modeKey] || modeKey}</span>
+                    <small>
+                      在线 {onlineCount}/{execNodes.length}
+                    </small>
+                    {runningCount > 0 && <small className="exec-busy-tag">执行中 {runningCount}</small>}
+                  </button>
+                  {execOpen && (
+                    <div className="exec-popover" role="dialog" aria-label="执行器实时状态面板">
+                      <div className="exec-popover-head">
+                        <div>
+                          <strong>小V猫执行器实时状态</strong>
+                          <small className="muted">
+                            当前模式：{EXECUTOR_MODES[modeKey] || modeKey}
+                          </small>
+                        </div>
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => setExecOpen(false)}
+                        >
+                          关闭
+                        </button>
+                      </div>
+                      {me.role === "admin" && (
+                        <div className="mode-switcher exec-popover-modes">
+                          {["server_direct", "server_relay", "client_local", "hybrid", "manual"].map(
+                            (m) => (
+                              <button
+                                key={m}
+                                type="button"
+                                className={
+                                  "mode-pill" +
+                                  (modeKey === m ? " active" : "") +
+                                  (m === "server_direct" ? " fallback" : "")
+                                }
+                                onClick={() =>
+                                  run(async () => {
+                                    setExecInfo(await post("/ops/executor/switch", { mode: m }));
+                                  }, `执行模式已切换为「${EXECUTOR_MODES[m]}」`)
+                                }
+                              >
+                                {EXECUTOR_MODES[m]}
+                              </button>
+                            ),
+                          )}
+                        </div>
+                      )}
+                      <div className="exec-popover-list">
+                        {execNodes.length > 0 ? (
+                          execNodes.map((n: Row) => (
+                            <div className="exec-popover-node" key={n.id}>
+                              <div className="exec-popover-node-main">
+                                <span
+                                  className={`exec-dot ${
+                                    n.status === "online" ? "online" : "offline"
+                                  }`}
+                                />
+                                <div>
+                                  <div className="exec-node-name">
+                                    <strong>{n.name}</strong>
+                                    {n.is_default && <span className="badge good">默认</span>}
+                                  </div>
+                                  <small className="muted">
+                                    {channelLabel(n.channel)} ·{" "}
+                                    {n.active_poll
+                                      ? "长轮询连线中"
+                                      : formatHeartbeatAge(n.heartbeat_age_sec)}{" "}
+                                    · 队列 {(n.queued_commands || 0) + (n.running_commands || 0)}
+                                  </small>
+                                </div>
+                              </div>
+                              <div className="exec-popover-node-actions">
+                                <Badge value={n.status} />
+                                {me.role === "admin" && n.status !== "revoked" && !n.is_default && (
+                                  <button
+                                    type="button"
+                                    className="text-button"
+                                    onClick={() =>
+                                      run(async () => {
+                                        setExecInfo(
+                                          await post("/ops/executor/switch", {
+                                            default_node_id: n.id,
+                                          }),
+                                        );
+                                      }, `已将「${n.name}」设为默认执行节点`)
+                                    }
+                                  >
+                                    设为默认
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <p className="muted">暂无执行节点</p>
+                        )}
+                      </div>
+                      <div className="exec-popover-foot">
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => {
+                            setExecOpen(false);
+                            setDeployOpen(true);
+                          }}
+                        >
+                          部署 / 启动 Agent
+                        </button>
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => {
+                            setExecOpen(false);
+                            go("ops-accounts");
+                          }}
+                        >
+                          账号与节点管理
+                        </button>
+                        {me.role === "admin" && (
+                          <button
+                            type="button"
+                            className="text-button"
+                            onClick={() => {
+                              setExecOpen(false);
+                              go("settings");
+                            }}
+                          >
+                            执行器设置
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
             {page !== "writers" && <select
               aria-label="筛选IP"
               value={ip}
@@ -369,6 +551,16 @@ export default function App() {
           </footer>
         </main>
       </div>
+      {deployOpen && (
+        <AgentDeployModal
+          ctx={ctx}
+          onClose={() => setDeployOpen(false)}
+          onDone={() => {
+            api<Row>("/ops/nodes").then(setExecInfo).catch(() => {});
+            refresh();
+          }}
+        />
+      )}
       {toast && (
         <div className="toast" role="status">
           <Check size={18} />

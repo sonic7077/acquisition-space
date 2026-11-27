@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from ..db import (
+    AgentCommand,
     AgentPairCode,
     AuthChallenge,
     ExecutorNode,
@@ -32,6 +33,15 @@ from ..db import (
 from ..knowledge import verified_document
 from ..security import active_ip, approver, can_ip, require_ip
 from ..writing import draft_checks
+from .agent_installer import (
+    DEFAULT_PROTOCOL_SCHEME,
+    SUPPORTED_AGENT_OS,
+    default_agent_download_urls,
+    render_install_script,
+    resolve_agent_download_urls,
+    try_start_local_agent,
+    validate_download_urls,
+)
 from .qr import render_qr_png
 from .transport import (
     MediaRef,
@@ -99,13 +109,33 @@ def _parse_iso(ts: str | None) -> datetime | None:
         return None
 
 
-def _node_dict(n: ExecutorNode) -> dict[str, Any]:
+def _node_dict(
+    n: ExecutorNode,
+    *,
+    default_node_id: str = "",
+    active_poll: bool = False,
+    queued_commands: int = 0,
+    running_commands: int = 0,
+) -> dict[str, Any]:
+    hb_dt = _parse_iso(n.last_heartbeat_at)
+    heartbeat_age_sec = max(0, int((datetime.now(timezone.utc) - hb_dt).total_seconds())) if hb_dt else None
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
     effective_status = n.status
     if n.status == "revoked":
         effective_status = "revoked"
+    elif active_poll and n.status != "mcp_error":
+        effective_status = "online"
     elif n.transport_mode == "agent_relay" and (not n.last_heartbeat_at or n.last_heartbeat_at < cutoff):
         effective_status = "offline"
+
+    caps = n.capabilities_json or {}
+    if n.transport_mode == "direct_http":
+        channel = "direct_http"
+    elif active_poll or caps.get("channel") == "long_poll":
+        channel = "long_poll"
+    else:
+        channel = "short_poll"
+
     return {
         "id": n.id,
         "name": n.name,
@@ -115,10 +145,17 @@ def _node_dict(n: ExecutorNode) -> dict[str, Any]:
         "mcp_url": n.mcp_url,
         "token_configured": bool(n.token_encrypted),
         "status": effective_status,
+        "mcp_ready": effective_status == "online",
+        "is_default": bool(default_node_id and default_node_id == n.id),
+        "heartbeat_age_sec": heartbeat_age_sec,
+        "channel": channel,
+        "active_poll": active_poll,
+        "queued_commands": queued_commands,
+        "running_commands": running_commands,
         "revoked_at": n.revoked_at,
         "vcat_version": n.vcat_version,
         "last_heartbeat_at": n.last_heartbeat_at,
-        "capabilities": n.capabilities_json or {},
+        "capabilities": caps,
         "updated_at": n.updated_at,
     }
 
@@ -476,20 +513,48 @@ class VcatOperationsService:
     # ---------- Nodes & Pairing ----------
 
     def list_nodes(self, actor: User) -> dict[str, Any]:
+        relay_bus = getattr(self.app.state, "relay_bus", None)
         with self.Session() as db:
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
-            self.router.ensure_direct_node(db)
+            direct_node = self.router.ensure_direct_node(db)
             settings = self._settings(db)
             ex = settings.get("executor", {})
+            default_node_id = (ex.get("default_node_id") or "").strip()
             rows = list(db.scalars(select(ExecutorNode).order_by(ExecutorNode.created_at.desc())))
+            pending_cmds = list(
+                db.scalars(select(AgentCommand).where(AgentCommand.status.in_(("queued", "leased"))))
+            )
             db.commit()
+
+        queued_map: dict[str, int] = {}
+        running_map: dict[str, int] = {}
+        for cmd in pending_cmds:
+            if cmd.status == "queued":
+                queued_map[cmd.node_id] = queued_map.get(cmd.node_id, 0) + 1
+            elif cmd.status == "leased":
+                running_map[cmd.node_id] = running_map.get(cmd.node_id, 0) + 1
 
         visible_nodes = []
         for n in rows:
-            if actor.role == "admin" or (n.node_scope == "client_local" and n.owner_user_id == actor.id):
-                visible_nodes.append(_node_dict(n))
+            if (
+                actor.role == "admin"
+                or n.node_scope in ("server_relay", "server_direct")
+                or (n.node_scope == "client_local" and n.owner_user_id == actor.id)
+            ):
+                active_poll = bool(relay_bus and relay_bus.is_long_polling(n.id))
+                visible_nodes.append(
+                    _node_dict(
+                        n,
+                        default_node_id=default_node_id,
+                        active_poll=active_poll,
+                        queued_commands=queued_map.get(n.id, 0),
+                        running_commands=running_map.get(n.id, 0),
+                    )
+                )
         return {
             "mode": ex.get("mode", "manual"),
+            "default_node_id": default_node_id,
+            "local_fallback_ready": bool(direct_node and direct_node.token_encrypted),
             "allow_client_local": bool(ex.get("allow_client_local", True)),
             "allow_interaction_write": bool(ex.get("allow_interaction_write", False)),
             "catchup_minutes": int(ex.get("catchup_minutes", 30)),
@@ -509,25 +574,173 @@ class VcatOperationsService:
 
             raw_code = "vcat_pair_" + secrets.token_urlsafe(18)
             expires = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+            resolved_label = (label or ("前端本机代理" if node_scope == "client_local" else "托管执行机")).strip()[:60]
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
             row = AgentPairCode(
                 id=uid(),
                 code_hash=hashlib.sha256(raw_code.encode()).hexdigest(),
                 node_scope=node_scope,
                 owner_user_id=actor.id if node_scope == "client_local" else None,
-                label=(label or ("前端本机代理" if node_scope == "client_local" else "托管执行机"))[:60],
+                label=resolved_label,
                 expires_at=expires,
                 created_by=actor.id,
             )
             db.add(row)
             db.commit()
         agent_mode = "client_local" if node_scope == "client_local" else "server_managed"
+        safe_label = resolved_label.replace('"', '\\"')
         return {
             "pair_code": raw_code,
             "node_scope": node_scope,
             "expires_at": expires,
-            "command_hint": f"python3 executor/vcat_agent.py --mode {agent_mode} --server <获客空间URL> --pair-token {raw_code}",
+            "command_hint": (
+                f"python3 executor/vcat_agent.py --mode {agent_mode} "
+                f'--server <获客空间URL> --pair-token {raw_code} --node-name "{safe_label}"'
+            ),
         }
+
+    def rename_node(self, actor: User, node_id: str, name: str) -> dict[str, Any]:
+        clean = name.strip()
+        if not clean or len(clean) > 80:
+            raise HTTPException(422, "节点名称长度须为 1 至 80 个字符")
+        relay_bus = getattr(self.app.state, "relay_bus", None)
+        with self.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            if node_id == "server-direct-default":
+                self.router.ensure_direct_node(db)
+            node = db.get(ExecutorNode, node_id)
+            if not node:
+                raise HTTPException(404, "执行节点不存在")
+            if not self._can_manage_node(actor, node):
+                raise HTTPException(403, "无权修改该执行节点名称")
+            node.name = clean
+            node.updated_at = now()
+            default_node_id = (self._settings(db).get("executor", {}).get("default_node_id") or "").strip()
+            db.commit()
+            return _node_dict(
+                node,
+                default_node_id=default_node_id,
+                active_poll=bool(relay_bus and relay_bus.is_long_polling(node.id)),
+            )
+
+    def switch_executor(
+        self,
+        actor: User,
+        *,
+        mode: str | None = None,
+        default_node_id: str | None = ...,
+    ) -> dict[str, Any]:
+        if actor.role != "admin":
+            raise HTTPException(403, "仅管理员可切换执行模式与默认节点")
+        if mode is not None and mode not in ("manual", "server_direct", "server_relay", "client_local", "hybrid"):
+            raise HTTPException(422, "执行器模式无效")
+        with self.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            if default_node_id is not ...:
+                clean_default = (default_node_id or "").strip()
+                if clean_default:
+                    if clean_default == "server-direct-default":
+                        self.router.ensure_direct_node(db)
+                    target = db.get(ExecutorNode, clean_default)
+                    if not target or target.status == "revoked":
+                        raise HTTPException(404, "默认执行节点不存在或已吊销")
+            else:
+                clean_default = None
+
+            settings_row = db.get(Record, "system-settings")
+            if not settings_row:
+                settings_row = Record(id="system-settings", kind="settings", payload={})
+                db.add(settings_row)
+            payload = dict(settings_row.payload or {})
+            ex = dict(payload.get("executor") or {})
+            if mode is not None:
+                ex["mode"] = mode
+            if clean_default is not None:
+                ex["default_node_id"] = clean_default
+            payload["executor"] = ex
+            settings_row.payload = payload
+            settings_row.updated_at = now()
+            db.commit()
+        return self.list_nodes(actor)
+
+    def get_agent_deploy_config(self, actor: User, base_url: str) -> dict[str, Any]:
+        with self.Session() as db:
+            ex = self._settings(db).get("executor", {})
+        custom_urls = ex.get("agent_download_urls") or {}
+        return {
+            "supported_os": SUPPORTED_AGENT_OS,
+            "default_urls": default_agent_download_urls(base_url),
+            "custom_urls": custom_urls if actor.role == "admin" else {},
+            "effective_urls": resolve_agent_download_urls(base_url, custom_urls),
+            "protocol_scheme": DEFAULT_PROTOCOL_SCHEME,
+            "protocol_start_url": f"{DEFAULT_PROTOCOL_SCHEME}://start",
+            "keepalive_summary": [
+                "第 1 层 · OS 原生守护：macOS LaunchAgent (KeepAlive=true, 5秒自启) / Windows 计划任务+循环守护 / Linux systemd (Restart=always)",
+                "第 2 层 · 进程防假死：单实例文件锁防多开、120秒看门狗阻塞自杀重拉、日志轮转与 7 天媒体缓存自动清理",
+                "第 3 层 · 断网与发版自愈：HTTP 长轮询自动重连、1s→10s 退避重试、receipts.json 幂等回执补报",
+                "第 4 层 · Web 监控兜底：顶部实时胶囊与每 3 秒节点面板标红告警，支持一键切回本地直连兜底",
+            ],
+        }
+
+    def create_agent_deploy_plan(
+        self,
+        actor: User,
+        *,
+        os_key: str,
+        node_scope: str,
+        label: str,
+        download_url: str | None,
+        server_url: str,
+        poll_wait: float = 25.0,
+    ) -> dict[str, Any]:
+        if os_key not in SUPPORTED_AGENT_OS:
+            raise HTTPException(422, f"不支持的操作系统类型: {os_key}")
+        clean_server = server_url.strip().rstrip("/")
+        if not clean_server:
+            raise HTTPException(422, "服务端访问地址不能为空")
+        parsed_srv = urlparse(clean_server)
+        if parsed_srv.scheme not in ("http", "https") or not parsed_srv.netloc:
+            raise HTTPException(422, "服务端访问地址须为有效 HTTP/HTTPS URL")
+
+        with self.Session() as db:
+            custom_urls = self._settings(db).get("executor", {}).get("agent_download_urls") or {}
+        effective_urls = resolve_agent_download_urls(clean_server, custom_urls)
+        resolved_download_url = (download_url or "").strip() or effective_urls[os_key]
+        try:
+            validate_download_urls({os_key: resolved_download_url})
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+        pair = self.create_pair_code(actor, node_scope, label)
+        agent_mode = "client_local" if node_scope == "client_local" else "server_managed"
+        node_name = (label or ("个人本机Agent" if node_scope == "client_local" else "托管桌面Agent")).strip()
+        script_filename, script_content, one_line = render_install_script(
+            os_key=os_key,
+            download_url=resolved_download_url,
+            server_url=clean_server,
+            agent_mode=agent_mode,
+            pair_code=pair["pair_code"],
+            node_name=node_name,
+            poll_wait=poll_wait,
+        )
+        return {
+            "os_key": os_key,
+            "os_label": SUPPORTED_AGENT_OS[os_key]["label"],
+            "keepalive_detail": SUPPORTED_AGENT_OS[os_key]["keepalive"],
+            "node_scope": node_scope,
+            "node_name": node_name,
+            "pair_code": pair["pair_code"],
+            "expires_at": pair["expires_at"],
+            "download_url": resolved_download_url,
+            "package_url": f"{clean_server}/api/ops/agent/package?os={os_key}",
+            "script_filename": script_filename,
+            "script_content": script_content,
+            "one_line_command": one_line,
+            "protocol_start_url": f"{DEFAULT_PROTOCOL_SCHEME}://start",
+        }
+
+    def try_local_agent_start(self, actor: User) -> dict[str, Any]:
+        return try_start_local_agent()
 
     def probe_node(self, actor: User, node_id: str) -> dict[str, Any]:
         with self.Session() as db:
@@ -582,8 +795,8 @@ class VcatOperationsService:
     def revoke_node(self, actor: User, node_id: str) -> dict[str, Any]:
         if node_id == "server-direct-default":
             raise HTTPException(422, "内置直连节点不可吊销，请通过「系统设置 → 发布执行器」切换模式停用")
-        from ..db import AgentCommand
 
+        relay_bus = getattr(self.app.state, "relay_bus", None)
         with self.Session() as db:
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
             node = db.get(ExecutorNode, node_id)
@@ -595,6 +808,13 @@ class VcatOperationsService:
             node.status = "revoked"
             node.revoked_at = now()
             node.updated_at = now()
+            settings_row = db.get(Record, "system-settings")
+            if settings_row:
+                ex = dict((settings_row.payload or {}).get("executor") or {})
+                if (ex.get("default_node_id") or "").strip() == node.id:
+                    ex["default_node_id"] = ""
+                    settings_row.payload = {**(settings_row.payload or {}), "executor": ex}
+                    settings_row.updated_at = now()
             for cmd in db.scalars(
                 select(AgentCommand).where(AgentCommand.node_id == node.id, AgentCommand.status.in_(("queued", "leased")))
             ):
@@ -623,7 +843,10 @@ class VcatOperationsService:
                 duration_ms=0,
             )
             db.commit()
-            return _node_dict(node)
+            result = _node_dict(node)
+        if relay_bus:
+            relay_bus.notify_command(node_id)
+        return result
 
     def delete_node(self, actor: User, node_id: str) -> dict[str, Any]:
         if node_id == "server-direct-default":

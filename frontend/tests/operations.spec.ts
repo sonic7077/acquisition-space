@@ -39,18 +39,53 @@ test("运营主菜单、双模式设置、账号授权iframe、扫脸QR、草稿
   await request.post("/api/assets", { multipart: { draft_id: draft.id, file: { name: "demo.mp4", mimeType: "video/mp4", buffer: Buffer.from("\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00") } } });
   await request.post("/api/schedules", { data: { draft_id: draft.id, platform: "抖音", account: "测试抖音号", planned_at: new Date().toISOString() } });
 
-  // 1. Settings -> 发布执行器 dual-mode configuration & pairing command
+  // 1. Settings -> 发布执行器 dual-mode configuration, live node panel, rename & pairing command
   await page.getByRole("button", { name: "系统设置", exact: true }).click();
   await page.getByRole("button", { name: "发布执行器", exact: true }).click();
   await page.getByLabel("执行模式").selectOption("server_direct");
   await page.getByLabel("小V猫 MCP 地址（同机直连用）").fill(mockMcpUrl);
   await page.getByLabel(/小V猫 MCP 令牌/).fill(mockMcpToken);
   await page.getByRole("button", { name: "保存设置", exact: true }).click();
+  await expect(page.getByText("实时状态 · 每3秒自动更新")).toBeVisible();
+  await page.locator("tr", { hasText: "本地直连兜底小V猫" }).getByRole("button", { name: "改名" }).click();
+  await page.getByLabel("编辑节点名称").fill("办公室兜底机");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(page.locator("tr", { hasText: "办公室兜底机" })).toBeVisible();
+
+  await page.getByLabel("自定义节点名称").fill("家里迷你主机");
   await page.getByRole("button", { name: "生成前端本机代理配对命令", exact: true }).click();
   await expect(page.locator("pre")).toContainText("executor/vcat_agent.py --mode client_local");
+  await expect(page.locator("pre")).toContainText("家里迷你主机");
 
-  // 2. 运营 -> 账号与授权: sync accounts, bind IP, open iframe login modal, trigger Channels verify link
+  // Custom OS agent download URLs + Agent Deploy Modal
+  await page.getByLabel("Agent下载地址-windows_x64").fill("https://mirrors.example.com/vcat-win.zip");
+  await page.getByRole("button", { name: "保存下载地址", exact: true }).click();
+  await expect(page.getByLabel("Agent下载地址-windows_x64")).toHaveValue("https://mirrors.example.com/vcat-win.zip");
+
+  await page.getByRole("button", { name: "部署 / 启动 Agent" }).click();
+  const deployDlg = page.getByRole("dialog", { name: "部署 / 启动小V猫 Agent 服务" });
+  await deployDlg.getByRole("button", { name: "Windows 10/11 (x64)", exact: true }).click();
+  await expect(deployDlg.getByLabel("Agent下载URL")).toHaveValue("https://mirrors.example.com/vcat-win.zip");
+  await deployDlg.getByLabel("部署节点名称").fill("办公室Win11部署机");
+  await deployDlg.getByRole("button", { name: "生成自动部署与启动方案" }).click();
+  await expect(deployDlg.getByRole("button", { name: /下载一键安装启动脚本/ })).toBeVisible();
+  await expect(deployDlg.locator("pre")).toContainText("--register-only");
+  await deployDlg.getByRole("button", { name: "拉起已安装的 Agent 服务" }).click();
+  await expect(deployDlg.getByRole("link", { name: /通过本机协议拉起 Agent/ })).toBeVisible();
+  await deployDlg.getByRole("button", { name: "关闭" }).click();
+  await page.getByRole("button", { name: "恢复默认地址", exact: true }).click();
+
+  // Header live status capsule & popover
+  await page.getByRole("button", { name: /执行器实时状态/ }).click();
+  const execPop = page.getByRole("dialog", { name: "执行器实时状态面板" });
+  await expect(execPop).toContainText("办公室兜底机");
+  await expect(execPop.getByRole("button", { name: "本地直连兜底" })).toBeVisible();
+  await execPop.getByRole("button", { name: "关闭" }).click();
+
+  // 2. 运营 -> 账号与授权: live status card, sync accounts, bind IP, open iframe login modal, trigger Channels verify link
   await page.getByRole("button", { name: "账号与授权", exact: true }).click();
+  await expect(page.getByText("实时状态 · 每3秒自动更新")).toBeVisible();
+  await expect(page.getByText("办公室兜底机")).toBeVisible();
   await page.getByRole("button", { name: "同步节点账号", exact: true }).click();
   await expect(page.getByText("测试抖音号")).toBeVisible();
   await expect(page.getByText("测试视频号")).toBeVisible();
