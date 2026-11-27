@@ -242,7 +242,7 @@ export default function OpsTasks(c: Ctx & { initialScheduleId?: string }) {
   return (
     <>
       <Notice>
-        统一发布任务中心：抖音/小红书/视频号/B站走小V猫 MCP。提交发布或推草稿箱后，系统会自动向平台查询确认真实结果并反馈失败原因；发布失败可直接修改文字/视频并再次发布。结果未知（UNKNOWN）禁止直接重试，须先核对状态。
+        统一发布任务中心：抖音/小红书/视频号/B站走渠道推广器 MCP。提交发布或推草稿箱后，系统会自动向平台查询确认真实结果并反馈失败原因；发布失败可直接修改文字/视频并再次发布。结果未知（UNKNOWN）禁止直接重试，须先核对状态。
       </Notice>
 
       {feedback && (
@@ -573,7 +573,7 @@ export default function OpsTasks(c: Ctx & { initialScheduleId?: string }) {
       {promoteTarget && (
         <Modal title={`草稿转正式发布 · ${promoteTarget.title || promoteTarget.draft_id}`} onClose={() => setPromoteTarget(null)}>
           <Notice>
-            将调用小V猫把草稿 #{promoteTarget.vendor_draft_id} 转为正式发布任务（账号：{promoteTarget.account_nickname}）。提交后会自动查询确认平台结果。
+            将调用渠道推广器把草稿 #{promoteTarget.vendor_draft_id} 转为正式发布任务（账号：{promoteTarget.account_nickname}）。提交后会自动查询确认平台结果。
           </Notice>
           <form onSubmit={promoteDraft}>
             <Field label="定时调度归属">

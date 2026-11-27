@@ -103,7 +103,25 @@ def start_mock_mcp_server(token: str = "mock-mcp-token-secret") -> tuple[Threadi
                     state.fail_next_tool = False
                     res = {"isError": True, "content": [{"type": "text", "text": "模拟MCP报错"}]}
                 elif tname == "vcat_list_accounts":
-                    res = {"content": [{"type": "text", "text": json.dumps({"total": len(state.accounts), "list": state.accounts})}]}
+                    page = max(1, int(args.get("page") or 1))
+                    page_size = max(1, int(args.get("pageSize") or 100))
+                    start = (page - 1) * page_size
+                    page_items = state.accounts[start : start + page_size]
+                    res = {"content": [{"type": "text", "text": json.dumps({"total": len(state.accounts), "list": page_items})}]}
+                elif tname == "vcat_list_verify_results":
+                    res = {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    {
+                                        "total": 1,
+                                        "list": [{"uid": "ch_001", "verified": True, "abnormalPostCount": 0, "faceStatus": {"status": "success"}}],
+                                    }
+                                ),
+                            }
+                        ]
+                    }
                 elif tname == "vcat_create_login_link":
                     lid = 40000 + len(state.login_links) + 1
                     plat = args.get("platform", "抖音")
@@ -1310,3 +1328,385 @@ def test_vcat_agent_node_name_bidirectional_sync_and_health(tmp_path):
         assert next(n for n in nodes_after if n["id"] == node_id)["name"] == "mac-studio"
     finally:
         mcp_srv.shutdown()
+
+
+def _write_fake_vcat_home(
+    vcat_home: Path,
+    *,
+    active_uid: str,
+    nickname: str = "",
+    username: str = "",
+    mobile: str = "",
+    remark: str = "",
+    accounts_meta: list[dict] | None = None,
+) -> None:
+    import sqlite3
+
+    vcat_home.mkdir(parents=True, exist_ok=True)
+    cfg = {
+        "mcp-setting": {"userId": str(active_uid), "enabled": True, "port": 3199, "writeModules": {"post": True}},
+        "Login_default_id": str(active_uid),
+    }
+    (vcat_home / "local.config").write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+
+    items = accounts_meta or [{"user_id": active_uid, "nickname": nickname, "username": username, "mobile": mobile}]
+    for item in items:
+        uid = str(item.get("user_id") or active_uid)
+        acc_dir = vcat_home / uid
+        acc_dir.mkdir(parents=True, exist_ok=True)
+        db_path = acc_dir / "vcat.db"
+        if db_path.exists():
+            db_path.unlink()
+        con = sqlite3.connect(str(db_path))
+        try:
+            con.execute(
+                "CREATE TABLE user (user_id INTEGER, sub_id TEXT, name TEXT, nickname TEXT, phone TEXT, mobile TEXT, token TEXT, password TEXT, cookie TEXT)"
+            )
+            con.execute(
+                "INSERT INTO user (user_id, sub_id, name, nickname, phone, mobile, token, password, cookie) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(uid),
+                    item.get("sub_id") or "",
+                    item.get("username") or username,
+                    item.get("nickname") or nickname,
+                    item.get("mobile") or mobile,
+                    item.get("mobile") or mobile,
+                    "secret-token-should-never-leak",
+                    "secret-pass-should-never-leak",
+                    "top-secret-cookie",
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+
+def test_local_promoter_probe_and_privacy(tmp_path):
+    from backend.app.operations.promoter_probe import build_promoter_display_label, detect_local_promoter_state, mask_mobile_text
+    from executor.vcat_agent import detect_local_promoter_state as agent_detect_local_promoter_state
+
+    assert mask_mobile_text("13812345678") == "138****5678"
+    assert build_promoter_display_label(remark="主控备注", nickname="昵称", username="user1", masked_mobile="138****5678", external_user_id="100") == "主控备注"
+    assert build_promoter_display_label(remark="", nickname="阿星", username="user1", masked_mobile="138****5678", external_user_id="100") == "阿星（138****5678）"
+    assert build_promoter_display_label(remark="", nickname="阿星", username="user1", masked_mobile="", external_user_id="100") == "阿星"
+    assert build_promoter_display_label(remark="", nickname="", username="user1", masked_mobile="138****5678", external_user_id="100") == "user1（138****5678）"
+    assert build_promoter_display_label(remark="", nickname="", username="", masked_mobile="138****5678", external_user_id="100") == "138****5678"
+    assert build_promoter_display_label(remark="", nickname="", username="", masked_mobile="", external_user_id="100") == "渠道推广器 #100"
+
+    vcat_home = tmp_path / "vcat_home"
+    _write_fake_vcat_home(
+        vcat_home,
+        active_uid="280196",
+        nickname="阿星运营",
+        username="axing_ops",
+        mobile="13812345678",
+        accounts_meta=[{"user_id": "280196", "nickname": "阿星运营", "username": "axing_ops", "mobile": "13812345678"}],
+    )
+
+    for probe_fn in (detect_local_promoter_state, agent_detect_local_promoter_state):
+        probed = probe_fn(data_home=str(vcat_home), provider="vcat")
+        assert probed["detected"] is True
+        assert probed["active_account"]["external_user_id"] == "280196"
+        assert probed["active_account"]["masked_mobile"] == "138****5678"
+        assert probed["active_account"]["display_label"] == "阿星运营（138****5678）"
+        serialized = json.dumps(probed, ensure_ascii=False)
+        assert "13812345678" not in serialized
+        assert "secret-token" not in serialized
+        assert "secret-pass" not in serialized
+        assert "top-secret-cookie" not in serialized
+
+
+def test_promoter_activation_paginated_import_and_switch_guard(tmp_path):
+    import urllib.request
+    from fastapi.testclient import TestClient
+    from executor.vcat_agent import VcatAgentRunner, _start_local_health_server
+
+    mcp_srv, mcp_url, mcp_state = start_mock_mcp_server()
+    # Populate 105 accounts (ch_001 + 104 more) to exercise multi-page pagination (pageSize=100)
+    extra_accounts = [
+        {"uid": f"dy_{i:03d}", "platform": "Douyin", "platformName": "抖音", "nickname": f"矩阵抖音{i:03d}", "loginStatus": "登录有效", "groupName": "矩阵组", "fansCount": i}
+        for i in range(1, 105)
+    ]
+    mcp_state.accounts = [
+        {"uid": "ch_001", "platform": "Channels", "platformName": "视频号", "nickname": "测试视频号", "loginStatus": "登录有效"},
+        *extra_accounts,
+    ]
+
+    vcat_home = tmp_path / "vcat_data"
+    _write_fake_vcat_home(
+        vcat_home,
+        active_uid="280196",
+        nickname="阿星主号",
+        username="axing",
+        mobile="13812345678",
+        accounts_meta=[{"user_id": "280196", "nickname": "阿星主号", "username": "axing", "mobile": "13812345678"}],
+    )
+
+    stop_evt = threading.Event()
+    poll_thread: threading.Thread | None = None
+    try:
+        app, admin, _, _, _, _, _, _ = _setup_workspace(tmp_path)
+        assert admin.put("/api/settings", json={"executor": {"mode": "hybrid"}}).status_code == 200
+        pair = admin.post("/api/ops/nodes/pair-code", json={"node_scope": "server_relay", "label": "推广托管机"}).json()
+        state_dir = str(tmp_path / "agent_state")
+        runner = VcatAgentRunner(
+            server_url="http://testserver",
+            mcp_url=mcp_url,
+            mcp_token="mock-mcp-token-secret",
+            state_dir=state_dir,
+            mode="server_relay",
+            node_name="推广托管机",
+            data_home=str(vcat_home),
+            min_interval_sec=0.0,
+            server_http_client=TestClient(app),
+        )
+        reg = runner.register(pair["pair_code"], "推广托管机")
+        node_id = reg["node_id"]
+        hb = runner.heartbeat_once()
+        assert hb["promoter_activated"] is False
+
+        # Agent local /health and / HTML page expose promoter identity & zero legacy branding
+        health_srv = _start_local_health_server(runner, "http://127.0.0.1:18787", port=0)
+        assert health_srv is not None
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{health_srv.server_port}/health", timeout=3) as resp:
+                h_json = json.loads(resp.read().decode("utf-8"))
+            assert h_json["promoter_display_label"] == "阿星主号（138****5678）"
+            assert h_json["promoter_activated"] is False
+            with urllib.request.urlopen(f"http://127.0.0.1:{health_srv.server_port}/", timeout=3) as resp:
+                html = resp.read().decode("utf-8")
+            assert "渠道推广器" in html and "阿星主号" in html and "小V猫" not in html
+        finally:
+            health_srv.shutdown()
+
+        # Start relay polling loop so preview & activate execute MCP calls through the agent
+        def _agent_loop():
+            while not stop_evt.is_set():
+                try:
+                    runner.poll_once()
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
+        poll_thread = threading.Thread(target=_agent_loop, daemon=True)
+        poll_thread.start()
+
+        # Pending activation shows in /api/ops/promoter-accounts
+        pa_list = admin.get("/api/ops/promoter-accounts").json()
+        assert len(pa_list["pending_activations"]) == 1
+        assert pa_list["pending_activations"][0]["external_user_id"] == "280196"
+        assert pa_list["pending_activations"][0]["masked_mobile"] == "138****5678"
+
+        # Preview import reads total count across paginated MCP + snapshots
+        prev = admin.post("/api/ops/promoter-accounts/preview-import", json={"node_id": node_id}).json()
+        assert prev["detected"] is True
+        assert prev["already_activated"] is False
+        assert prev["account_count"] == 105
+        assert prev["post_count"] == 1
+        assert prev["verify_count"] == 1
+
+        # Activate & import all 105 accounts + posts + verify + stats
+        act = admin.post(
+            "/api/ops/promoter-accounts/activate",
+            json={
+                "node_id": node_id,
+                "remark": "上海主控",
+                "owner_scope": "team_shared",
+                "import_posts": True,
+                "import_verify": True,
+                "import_stats": True,
+            },
+        )
+        assert act.status_code == 200, act.text
+        act_body = act.json()
+        promoter_id = act_body["promoter_account"]["id"]
+        assert act_body["promoter_account"]["display_label"] == "上海主控"
+        assert act_body["promoter_account"]["runtime_status"] == "online_active"
+        assert act_body["import_summary"]["accounts_imported"] == 105
+        assert act_body["import_summary"]["posts_imported"] == 1
+
+        # Verify posts cleaned -1 -> None and verify results populated
+        posts_resp = admin.get("/api/ops/posts").json()
+        assert any(p["vendor_post_id"] == "xhs_post_1" and p["fans_add"] is None and p["avg_view_sec"] is None for p in posts_resp)
+        accs = admin.get(f"/api/ops/accounts?promoter_account_id={promoter_id}").json()
+        assert len(accs) == 105
+        ch_acc = next(a for a in accs if a["vendor_uid"] == "ch_001")
+        assert ch_acc["is_verified"] is True
+        assert ch_acc["availability_status"] == "ready"
+        assert ch_acc["source"] == "promoter_import"
+
+        # Pending activations cleared
+        assert admin.get("/api/ops/promoter-accounts").json()["pending_activations"] == []
+
+        # PATCH remark & masked_mobile works
+        upd = admin.patch(f"/api/ops/promoter-accounts/{promoter_id}", json={"remark": "华东总号"})
+        assert upd.status_code == 200
+        assert upd.json()["display_label"] == "华东总号"
+
+        # Switch client to another promoter account 363878
+        _write_fake_vcat_home(
+            vcat_home,
+            active_uid="363878",
+            nickname="阿莫备号",
+            username="amo",
+            accounts_meta=[{"user_id": "363878", "nickname": "阿莫备号", "username": "amo"}],
+        )
+        hb_switch = runner.heartbeat_once()
+        assert hb_switch["promoter_activated"] is False
+
+        pa_after_switch = admin.get("/api/ops/promoter-accounts").json()
+        assert len(pa_after_switch["pending_activations"]) == 1
+        assert pa_after_switch["pending_activations"][0]["external_user_id"] == "363878"
+        old_pa = next(p for p in pa_after_switch["items"] if p["id"] == promoter_id)
+        assert old_pa["runtime_status"] == "switched_away"
+
+        # Old promoter's accounts are preserved (not removed!) and marked promoter_switched
+        switched_accs = admin.get(f"/api/ops/accounts?promoter_account_id={promoter_id}").json()
+        assert len(switched_accs) == 105
+        assert all(a["active"] is True and a["availability_status"] == "promoter_switched" for a in switched_accs)
+
+        # Execution guard rejects live MCP call on switched-away promoter account with 409
+        blocked = admin.post(f"/api/ops/accounts/{ch_acc['id']}/verify", json={})
+        assert blocked.status_code == 409
+        assert "已切换" in blocked.json()["detail"]
+    finally:
+        stop_evt.set()
+        if poll_thread is not None:
+            poll_thread.join(timeout=2)
+        mcp_srv.shutdown()
+
+
+def test_promoter_cross_node_migration_and_leader_shared_visibility(tmp_path):
+    from fastapi.testclient import TestClient
+    from executor.vcat_agent import VcatAgentRunner
+
+    mcp_srv, mcp_url, _ = start_mock_mcp_server()
+    vcat_home = tmp_path / "shared_vcat"
+    _write_fake_vcat_home(
+        vcat_home,
+        active_uid="900001",
+        nickname="团队总号",
+        username="team_main",
+        accounts_meta=[{"user_id": "900001", "nickname": "团队总号", "username": "team_main"}],
+    )
+    stop_evt = threading.Event()
+    poll_thread: threading.Thread | None = None
+    try:
+        app, admin, member, ip, _, _, _, _ = _setup_workspace(tmp_path)
+        assert admin.put("/api/settings", json={"executor": {"mode": "hybrid"}}).status_code == 200
+        team_id = ip["team_id"]
+        assert admin.post(
+            "/api/users",
+            json={"username": "leader1", "name": "团队长甲", "password": "Leader-123456!", "role": "leader", "team_id": team_id, "ip_ids": [ip["id"]]},
+        ).status_code == 200
+        leader = TestClient(app)
+        assert leader.post("/api/auth/login", json={"username": "leader1", "password": "Leader-123456!"}).status_code == 200
+
+        # Node A registers and activates 900001
+        pair_a = admin.post("/api/ops/nodes/pair-code", json={"node_scope": "server_relay", "label": "节点A"}).json()
+        runner_a = VcatAgentRunner(
+            server_url="http://testserver",
+            mcp_url=mcp_url,
+            mcp_token="mock-mcp-token-secret",
+            state_dir=str(tmp_path / "state_a"),
+            mode="server_relay",
+            node_name="节点A",
+            data_home=str(vcat_home),
+            min_interval_sec=0.0,
+            server_http_client=TestClient(app),
+        )
+        node_a_id = runner_a.register(pair_a["pair_code"], "节点A")["node_id"]
+        runner_a.heartbeat_once()
+
+        def _poll_a():
+            while not stop_evt.is_set():
+                try:
+                    runner_a.poll_once()
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
+        poll_thread = threading.Thread(target=_poll_a, daemon=True)
+        poll_thread.start()
+
+        act = admin.post(
+            "/api/ops/promoter-accounts/activate",
+            json={"node_id": node_a_id, "owner_scope": "team_shared", "import_posts": False, "import_verify": False, "import_stats": False},
+        )
+        assert act.status_code == 200, act.text
+        promoter_id = act.json()["promoter_account"]["id"]
+
+        all_accs = admin.get("/api/ops/accounts").json()
+        dy_acc = next(a for a in all_accs if a["vendor_uid"] == "dy_001")
+        xhs_acc = next(a for a in all_accs if a["vendor_uid"] == "xhs_001")
+        assert admin.post(f"/api/ops/accounts/{dy_acc['id']}/bind", json={"ip_id": ip["id"]}).status_code == 200
+
+        # Member only sees IP-bound accounts (not unbound xhs_001)
+        member_accs = member.get("/api/ops/accounts").json()
+        assert [a["vendor_uid"] for a in member_accs] == ["dy_001"]
+
+        # Leader sees unbound shared accounts & can claim/bind xhs_001 to team IP
+        leader_unbound = leader.get("/api/ops/accounts?unbound_only=true").json()
+        assert any(a["vendor_uid"] == "xhs_001" for a in leader_unbound)
+        assert leader.post(f"/api/ops/accounts/{xhs_acc['id']}/bind", json={"ip_id": ip["id"]}).status_code == 200
+
+        # Same promoter 900001 signs in on Node B -> cross-node migration preserves IP bindings & avoids duplicate PromoterAccount
+        pair_b = admin.post("/api/ops/nodes/pair-code", json={"node_scope": "server_relay", "label": "节点B"}).json()
+        runner_b = VcatAgentRunner(
+            server_url="http://testserver",
+            mcp_url=mcp_url,
+            mcp_token="mock-mcp-token-secret",
+            state_dir=str(tmp_path / "state_b"),
+            mode="server_relay",
+            node_name="节点B",
+            data_home=str(vcat_home),
+            min_interval_sec=0.0,
+            server_http_client=TestClient(app),
+        )
+        node_b_id = runner_b.register(pair_b["pair_code"], "节点B")["node_id"]
+        hb_b = runner_b.heartbeat_once()
+        assert hb_b["promoter_activated"] is True
+
+        promoters = admin.get("/api/ops/promoter-accounts").json()["items"]
+        assert len([p for p in promoters if p["external_user_id"] == "900001"]) == 1
+        migrated = next(p for p in promoters if p["id"] == promoter_id)
+        assert migrated["node_id"] == node_b_id
+        assert migrated["runtime_status"] == "online_active"
+
+        migrated_accs = admin.get(f"/api/ops/accounts?promoter_account_id={promoter_id}").json()
+        dy_after = next(a for a in migrated_accs if a["vendor_uid"] == "dy_001")
+        xhs_after = next(a for a in migrated_accs if a["vendor_uid"] == "xhs_001")
+        assert dy_after["ip_id"] == ip["id"]
+        assert xhs_after["ip_id"] == ip["id"]
+        assert dy_after["node_id"] == node_b_id
+        assert dy_after["availability_status"] == "ready"
+    finally:
+        stop_evt.set()
+        if poll_thread is not None:
+            poll_thread.join(timeout=2)
+        mcp_srv.shutdown()
+
+
+def test_ui_and_backend_debranding_zero_legacy_hits():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    targets = [
+        root / "frontend" / "src",
+        root / "frontend" / "tests",
+        root / "backend" / "app" / "operations",
+        root / "executor" / "vcat_agent.py",
+        root / "executor" / "vcat_agent.env.example",
+    ]
+    legacy_brand = "\u5c0fV\u732b"
+    hits: list[str] = []
+    for target in targets:
+        files = [target] if target.is_file() else [p for p in target.rglob("*") if p.is_file()]
+        for file_path in files:
+            if "__pycache__" in file_path.parts or file_path.suffix == ".pyc":
+                continue
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+            if legacy_brand in text:
+                hits.append(str(file_path.relative_to(root)))
+    assert hits == []
+

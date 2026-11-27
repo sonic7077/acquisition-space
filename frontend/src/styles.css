@@ -1963,3 +1963,20 @@ footer {
 .ops-verify-tag.fail { color:#b83232; font-weight:500; }
 .ops-task-error { color:#b83232; font-size:12px; font-weight:500; line-height:1.45; max-width:340px; word-break:break-word; }
 .text-button.primary-text { color:var(--accent, #2e72f0); font-weight:600; }
+
+/* Promoter account management & live status differentiation */
+.badge.warn { background:#fff7e6; border-color:#f4d38c; color:#9a6108; }
+.ops-pending-banner { display:grid; gap:10px; padding:14px 16px; border-radius:12px; border:1px solid #f0cfa0; background:#fffaf0; margin-bottom:16px; }
+.ops-pending-item { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; padding-top:8px; border-top:1px dashed #f0dcc0; }
+.ops-pending-item:first-of-type { padding-top:0; border-top:0; }
+.ops-promoter-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:12px; }
+.ops-promoter-card { border:1px solid #dfe6f2; background:#fbfdff; border-radius:10px; padding:13px 14px; display:grid; gap:9px; }
+.ops-promoter-card.switched { border-color:#f0cf99; background:#fffcf5; }
+.ops-promoter-card.offline { border-color:#e4e9f2; background:#f8fafc; opacity:0.84; }
+.ops-promoter-card-head { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
+.ops-promoter-meta { display:flex; flex-wrap:wrap; gap:6px; font-size:11px; color:#5a6b84; }
+.ops-promoter-actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.ops-filter-bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; padding:10px 12px; border-radius:9px; background:#f8fafd; border:1px solid #e6ecf5; }
+.ops-filter-bar select { min-width:170px; }
+.ops-row-dimmed { opacity:0.62; background:#fafbfd; }
+.ops-chip { display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:999px; font-size:11px; background:#edf2fa; color:#3d5170; border:1px solid #dbe4f2; }

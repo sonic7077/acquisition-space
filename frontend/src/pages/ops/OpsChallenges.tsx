@@ -23,11 +23,11 @@ export default function OpsChallenges(c: Ctx) {
   return (
     <>
       <Notice>
-        授权中心集中处理视频号云端扫脸验证二维码、Web 上号待办，以及「Web前端+本机小V猫」离线挂起任务的上线续跑；无需使用的待办可直接取消并回收登录链接。
+        授权中心集中处理视频号云端扫脸验证二维码、Web 上号待办，以及「Web前端+本机渠道推广器」离线挂起任务的上线续跑；无需使用的待办可直接取消并回收登录链接。
       </Notice>
 
       {offlineTasks.length > 0 && (
-        <Card title={`等待本机上线续跑的任务 · ${offlineTasks.length}`} subtitle="操作者电脑开机并启动本机小V猫代理后，可一键继续执行">
+        <Card title={`等待本机上线续跑的任务 · ${offlineTasks.length}`} subtitle="操作者电脑开机并启动本机渠道推广器代理后，可一键继续执行">
           <div className="table-scroll">
             <table>
               <thead>
@@ -57,7 +57,7 @@ export default function OpsChallenges(c: Ctx) {
                           c.run(async () => {
                             await post(`/ops/publish-tasks/${t.id}/retry`, {});
                             load();
-                          }, "已重新派发到本机小V猫")
+                          }, "已重新派发到本机渠道推广器")
                         }
                       >
                         本机已在线 · 立即续跑

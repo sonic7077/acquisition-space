@@ -57,6 +57,16 @@ export const STATE: Row = {
   offline: "离线",
   mcp_error: "MCP异常",
   revoked: "已吊销",
+  online_active: "在线 · 当前登录",
+  switched_away: "已切换其他账号",
+  service_error: "服务异常",
+  ready: "可执行",
+  platform_expired: "登录失效",
+  promoter_switched: "宿主账号已切换",
+  node_offline: "节点离线",
+  removed: "已移除",
+  promoter_import: "客户端同步",
+  web_iframe: "平台新增",
 };
 
 export function Badge({ value }: { value: string }) {
@@ -74,28 +84,42 @@ export function Badge({ value }: { value: string }) {
           "PUBLISHED",
           "VERIFIED",
           "online",
+          "online_active",
+          "ready",
           "登录有效",
         ].includes(value)
           ? "good"
           : [
-              "failed",
-              "needs_review",
-              "unknown",
-              "returned",
-              "UNKNOWN",
-              "REJECTED",
-              "RETRYABLE_FAILED",
-              "MISSED",
-              "EXPIRED",
-              "mcp_error",
-              "offline",
-              "revoked",
-              "已从小V猫移除",
-              "已在小V猫移除",
-              "登录失效",
-            ].includes(value)
-            ? "bad"
-            : "")
+                "switched_away",
+                "promoter_switched",
+                "WAITING_CLIENT_ONLINE",
+                "WAITING_AUTH",
+                "WAITING_SCAN",
+                "node_offline",
+              ].includes(value)
+            ? "warn"
+            : [
+                "failed",
+                "needs_review",
+                "unknown",
+                "returned",
+                "UNKNOWN",
+                "REJECTED",
+                "RETRYABLE_FAILED",
+                "MISSED",
+                "EXPIRED",
+                "mcp_error",
+                "offline",
+                "revoked",
+                "service_error",
+                "platform_expired",
+                "removed",
+                "已从渠道推广器移除",
+                "已在渠道推广器移除",
+                "登录失效",
+              ].includes(value)
+              ? "bad"
+              : "")
       }
     >
       {STATE[value] || value}

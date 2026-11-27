@@ -58,6 +58,7 @@ class ExecutorNode(Base):
     __tablename__ = 'executor_nodes'
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     name: Mapped[str] = mapped_column(String)
+    provider: Mapped[str] = mapped_column(String, default='vcat')
     node_scope: Mapped[str] = mapped_column(String, index=True)  # server_direct | server_relay | client_local
     owner_user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     transport_mode: Mapped[str] = mapped_column(String)  # direct_http | agent_relay
@@ -69,6 +70,10 @@ class ExecutorNode(Base):
     vcat_version: Mapped[str | None] = mapped_column(String, nullable=True)
     last_heartbeat_at: Mapped[str | None] = mapped_column(String, nullable=True)
     capabilities_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    active_promoter_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    active_promoter_sub_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    active_promoter_label: Mapped[str | None] = mapped_column(String, nullable=True)
+    detected_promoter_accounts_json: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[str] = mapped_column(String, default=now)
     updated_at: Mapped[str] = mapped_column(String, default=now, onupdate=now)
 
@@ -86,16 +91,47 @@ class AgentPairCode(Base):
     created_at: Mapped[str] = mapped_column(String, default=now)
 
 
+class PromoterAccount(Base):
+    __tablename__ = 'promoter_accounts'
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    provider: Mapped[str] = mapped_column(String, default='vcat', index=True)
+    external_user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    external_sub_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    nickname: Mapped[str] = mapped_column(String, default='')
+    username: Mapped[str | None] = mapped_column(String, nullable=True)
+    masked_mobile: Mapped[str | None] = mapped_column(String, nullable=True)
+    remark: Mapped[str] = mapped_column(String, default='')
+    avatar: Mapped[str | None] = mapped_column(Text, nullable=True)
+    node_id: Mapped[str] = mapped_column(String, index=True)
+    owner_scope: Mapped[str] = mapped_column(String, default='team_shared')  # team_shared | personal
+    owner_user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    identity_source: Mapped[str] = mapped_column(String, default='local_probe')  # local_probe | manual_fallback
+    capabilities_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String, default='active')  # active | disabled
+    activated_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    activated_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_seen_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_synced_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[str] = mapped_column(String, default=now)
+    updated_at: Mapped[str] = mapped_column(String, default=now, onupdate=now)
+
+
 class PlatformAccount(Base):
     __tablename__ = 'platform_accounts'
-    __table_args__ = (UniqueConstraint('node_id', 'vendor_uid', name='uq_platform_account_node_vendor'),)
+    __table_args__ = (UniqueConstraint('promoter_account_id', 'vendor_uid', name='uq_platform_account_promoter_vendor'),)
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     node_id: Mapped[str] = mapped_column(String, index=True)
+    promoter_account_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     vendor_uid: Mapped[str] = mapped_column(String, index=True)
     platform: Mapped[str] = mapped_column(String, index=True)
     platform_name: Mapped[str] = mapped_column(String, default='')
     nickname: Mapped[str] = mapped_column(String, default='')
     avatar: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String, default='promoter_import')  # promoter_import | web_iframe
+    group_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    tags_json: Mapped[list] = mapped_column(JSON, default=list)
+    remark: Mapped[str] = mapped_column(String, default='')
+    fans_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
     team_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     ip_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     login_status: Mapped[str] = mapped_column(String, default='未知')
@@ -262,7 +298,18 @@ def database(path):
     with engine.begin() as conn:
         for table, column, col_type in (
             ('executor_nodes', 'revoked_at', 'TEXT'),
+            ('executor_nodes', 'provider', "TEXT DEFAULT 'vcat'"),
+            ('executor_nodes', 'active_promoter_user_id', 'TEXT'),
+            ('executor_nodes', 'active_promoter_sub_id', 'TEXT'),
+            ('executor_nodes', 'active_promoter_label', 'TEXT'),
+            ('executor_nodes', 'detected_promoter_accounts_json', "JSON DEFAULT '[]'"),
             ('platform_accounts', 'removed_at', 'TEXT'),
+            ('platform_accounts', 'promoter_account_id', 'TEXT'),
+            ('platform_accounts', 'source', "TEXT DEFAULT 'promoter_import'"),
+            ('platform_accounts', 'group_name', 'TEXT'),
+            ('platform_accounts', 'tags_json', "JSON DEFAULT '[]'"),
+            ('platform_accounts', 'remark', "TEXT DEFAULT ''"),
+            ('platform_accounts', 'fans_total', 'INTEGER'),
             ('auth_challenges', 'vendor_link_id', 'TEXT'),
             ('publish_attempts', 'vendor_batch_name', 'TEXT'),
             ('publish_attempts', 'remote_status', 'TEXT'),

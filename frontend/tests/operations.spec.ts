@@ -43,11 +43,11 @@ test("运营主菜单、双模式设置、账号授权iframe、扫脸QR、草稿
   await page.getByRole("button", { name: "系统设置", exact: true }).click();
   await page.getByRole("button", { name: "发布执行器", exact: true }).click();
   await page.getByLabel("执行模式").selectOption("server_direct");
-  await page.getByLabel("小V猫 MCP 地址（同机直连用）").fill(mockMcpUrl);
-  await page.getByLabel(/小V猫 MCP 令牌/).fill(mockMcpToken);
+  await page.getByLabel("渠道推广器服务地址（同机直连用）").fill(mockMcpUrl);
+  await page.getByLabel(/渠道推广器访问令牌/).fill(mockMcpToken);
   await page.getByRole("button", { name: "保存设置", exact: true }).click();
   await expect(page.getByText("实时状态 · 每3秒自动更新")).toBeVisible();
-  await page.locator("tr", { hasText: "本地直连兜底小V猫" }).getByRole("button", { name: "改名" }).click();
+  await page.locator("tr", { hasText: "本地直连兜底渠道推广器" }).getByRole("button", { name: "改名" }).click();
   await page.getByLabel("编辑节点名称").fill("办公室兜底机");
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect(page.locator("tr", { hasText: "办公室兜底机" })).toBeVisible();
@@ -63,7 +63,7 @@ test("运营主菜单、双模式设置、账号授权iframe、扫脸QR、草稿
   await expect(page.getByLabel("Agent下载地址-windows_x64")).toHaveValue("https://mirrors.example.com/vcat-win.zip");
 
   await page.getByRole("button", { name: "部署 / 启动 Agent" }).click();
-  const deployDlg = page.getByRole("dialog", { name: "部署 / 启动小V猫 Agent 服务" });
+  const deployDlg = page.getByRole("dialog", { name: "部署 / 启动渠道推广器 Agent 服务" });
   await deployDlg.getByRole("button", { name: "Windows 10/11 (x64)", exact: true }).click();
   await expect(deployDlg.getByLabel("Agent下载URL")).toHaveValue("https://mirrors.example.com/vcat-win.zip");
   await deployDlg.getByLabel("部署节点名称").fill("办公室Win11部署机");
@@ -108,10 +108,10 @@ test("运营主菜单、双模式设置、账号授权iframe、扫脸QR、草稿
   // P0: Remove 小红书 account with nickname confirm, then toggle history visibility
   await page.locator("tr", { hasText: "测试小红书" }).getByRole("button", { name: "移除账号" }).click();
   await page.getByRole("dialog").getByPlaceholder("测试小红书").fill("测试小红书");
-  await page.getByRole("dialog").getByRole("button", { name: "确认从小V猫移除" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "确认从渠道推广器移除" }).click();
   await expect(page.locator("tr", { hasText: "测试小红书" })).toHaveCount(0);
   await page.getByLabel("显示已移除历史账号").check();
-  await expect(page.locator("tr", { hasText: "测试小红书" })).toContainText("已从小V猫移除");
+  await expect(page.locator("tr", { hasText: "测试小红书" })).toContainText("已从渠道推广器移除");
   await page.getByLabel("显示已移除历史账号").uncheck();
 
   // Trigger Channels face verify link -> navigates to 授权中心, shows QR PNG & allows cancel

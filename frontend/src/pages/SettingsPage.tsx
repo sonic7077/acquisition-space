@@ -60,12 +60,12 @@ const CONFIG: Record<
   },
   executor: {
     name: "发布执行器",
-    desc: "保留本地直连作为兜底模式，并统一管理多台远端/本机小V猫 Agent 节点。",
+    desc: "保留本地直连作为兜底模式，并统一管理多台远端/本机渠道推广器 Agent 节点。",
     fields: [
       ["mode", "执行模式", "executor_mode"],
       ["default_node_id", "默认执行节点（多节点优先）", "default_node"],
-      ["base_url", "小V猫 MCP 地址（同机直连用）"],
-      ["token", "小V猫 MCP 令牌（加密保存）", "password"],
+      ["base_url", "渠道推广器服务地址（同机直连用）"],
+      ["token", "渠道推广器访问令牌（加密保存）", "password"],
       ["catchup_minutes", "超时追发窗口（分钟）", "number"],
       ["preflight_minutes", "到期预检提前量（分钟）", "number"],
     ],
@@ -193,7 +193,7 @@ export default function SettingsPage(c: Ctx) {
                       : "")
                   }
                 >
-                  {type === "auth_mode" ? <select name={key} defaultValue={settings[tab]?.auth_mode||'app'}><option value="app">应用 App ID / App Secret</option><option value="cli">本机已授权飞书 CLI（无需复制密钥）</option></select> : type === "executor_mode" ? <select name={key} defaultValue={settings[tab]?.mode||'manual'}><option value="manual">仅手工登记（不调外部执行器）</option><option value="server_direct">本地直连兜底 · 同机直连小V猫 (server_direct)</option><option value="server_relay">服务器联通 · 托管桌面执行机 (server_relay)</option><option value="client_local">Web前端 + 本机小V猫模式 (client_local)</option><option value="hybrid">混合模式（按账号绑定节点自动路由）</option></select> : type === "default_node" ? <select name={key} defaultValue={settings[tab]?.default_node_id || ""}><option value="">自动选择（按在线节点与模式路由）</option>{(nodesInfo?.nodes || []).filter((n: Row) => n.status !== "revoked").map((n: Row) => <option key={n.id} value={n.id}>{n.name} ({n.node_scope})</option>)}</select> : type === "textarea" ? <textarea name={key} rows={5} defaultValue={settings[tab]?.[key] || ''} placeholder={'{"works":{"likes":"点赞数","author_id":"博主关联"}}'} /> : <input
+                  {type === "auth_mode" ? <select name={key} defaultValue={settings[tab]?.auth_mode||'app'}><option value="app">应用 App ID / App Secret</option><option value="cli">本机已授权飞书 CLI（无需复制密钥）</option></select> : type === "executor_mode" ? <select name={key} defaultValue={settings[tab]?.mode||'manual'}><option value="manual">仅手工登记（不调外部执行器）</option><option value="server_direct">本地直连兜底 · 同机直连渠道推广器 (server_direct)</option><option value="server_relay">服务器联通 · 托管桌面执行机 (server_relay)</option><option value="client_local">Web前端 + 本机渠道推广器模式 (client_local)</option><option value="hybrid">混合模式（按账号绑定节点自动路由）</option></select> : type === "default_node" ? <select name={key} defaultValue={settings[tab]?.default_node_id || ""}><option value="">自动选择（按在线节点与模式路由）</option>{(nodesInfo?.nodes || []).filter((n: Row) => n.status !== "revoked").map((n: Row) => <option key={n.id} value={n.id}>{n.name} ({n.node_scope})</option>)}</select> : type === "textarea" ? <textarea name={key} rows={5} defaultValue={settings[tab]?.[key] || ''} placeholder={'{"works":{"likes":"点赞数","author_id":"博主关联"}}'} /> : <input
                     name={key}
                     type={type || "text"}
                     step={tab === "discovery" || key === "overlap_max" ? "any" : undefined}
@@ -227,7 +227,7 @@ export default function SettingsPage(c: Ctx) {
               )}
               {['collection','feishu'].includes(tab) && <label className="check-row"><input name="enabled" type="checkbox" defaultChecked={settings[tab]?.enabled}/>{tab==='collection'?'启用TikHub采集':'启用飞书同步（采集完成后自动同步三表）'}</label>}
               {tab === 'executor' && <>
-                <label className="check-row"><input name="allow_client_local" type="checkbox" defaultChecked={settings.executor?.allow_client_local ?? true}/>允许操作者在个人电脑运行本机小V猫代理 (client_local)</label>
+                <label className="check-row"><input name="allow_client_local" type="checkbox" defaultChecked={settings.executor?.allow_client_local ?? true}/>允许操作者在个人电脑运行本机渠道推广器代理 (client_local)</label>
                 <label className="check-row"><input name="allow_interaction_write" type="checkbox" defaultChecked={Boolean(settings.executor?.allow_interaction_write)}/>允许在运营页外发评论回复与私信（默认关闭，仅受控人工确认触发）</label>
               </>}
               <div className="button-row">
@@ -305,7 +305,7 @@ export default function SettingsPage(c: Ctx) {
                 style={{ maxWidth: 260 }}
               />
               <button type="button" onClick={() => c.run(async () => setPairCmd(await post('/ops/nodes/pair-code', { node_scope: 'server_relay', label: nodeLabel.trim() || '服务器托管桌面执行机' })), '已生成服务器执行机配对命令')}>生成服务器执行机配对命令</button>
-              <button type="button" onClick={() => c.run(async () => setPairCmd(await post('/ops/nodes/pair-code', { node_scope: 'client_local', label: nodeLabel.trim() || '操作者本机小V猫' })), '已生成前端本机代理配对命令')}>生成前端本机代理配对命令</button>
+              <button type="button" onClick={() => c.run(async () => setPairCmd(await post('/ops/nodes/pair-code', { node_scope: 'client_local', label: nodeLabel.trim() || '操作者本机渠道推广器' })), '已生成前端本机代理配对命令')}>生成前端本机代理配对命令</button>
             </div>
             {pairCmd && <pre>{pairCmd.command_hint}</pre>}
             <div className="deploy-urls-config">

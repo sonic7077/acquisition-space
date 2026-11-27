@@ -41,10 +41,11 @@ type Props = {
   ctx: Ctx;
   nodesInfo?: Row | null;
   onChanged?: (next: Row) => void;
+  onActivateNode?: (nodeId: string) => void;
   embedded?: boolean;
 };
 
-export default function ExecutorNodesPanel({ ctx, nodesInfo, onChanged, embedded = false }: Props) {
+export default function ExecutorNodesPanel({ ctx, nodesInfo, onChanged, onActivateNode, embedded = false }: Props) {
   const [data, setData] = useState<Row | null>(nodesInfo || null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
@@ -152,7 +153,7 @@ export default function ExecutorNodesPanel({ ctx, nodesInfo, onChanged, embedded
 
       {currentMode === "server_direct" && data && !data.local_fallback_ready && (
         <p className="muted" style={{ marginBottom: 10 }}>
-          提示：当前已选择「本地直连兜底」，请在「系统设置 → 发布执行器」填写本机小V猫 MCP 令牌后保存。
+          提示：当前已选择「本地直连兜底」，请在「系统设置 → 发布执行器」填写本机渠道推广器访问令牌后保存。
         </p>
       )}
 
@@ -163,6 +164,7 @@ export default function ExecutorNodesPanel({ ctx, nodesInfo, onChanged, embedded
               <tr>
                 <th>节点名称</th>
                 <th>类型与归属</th>
+                <th>当前渠道推广器账号</th>
                 <th>实时状态</th>
                 <th>通道与队列</th>
                 <th>版本</th>
@@ -202,12 +204,27 @@ export default function ExecutorNodesPanel({ ctx, nodesInfo, onChanged, embedded
                   <td>{scopeLabel(n.node_scope)}</td>
                   <td>
                     <div className="exec-status-cell">
+                      <span>{n.active_promoter_label || "未检测到"}</span>
+                      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                        {n.active_promoter_user_id && (
+                          <small className="muted">#{n.active_promoter_user_id}</small>
+                        )}
+                        {n.active_promoter_user_id && (
+                          <span className={`badge ${n.active_promoter_activated ? "good" : "warn"}`}>
+                            {n.active_promoter_activated ? "已激活" : "未激活"}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="exec-status-cell">
                       <Badge value={n.status} />
                       <small className="muted">
                         {n.active_poll
                           ? "长轮询连线中"
                           : n.id === "server-direct-default" && !n.token_configured
-                            ? "未配置 MCP 令牌"
+                            ? "未配置访问令牌"
                             : formatHeartbeatAge(n.heartbeat_age_sec)}
                       </small>
                     </div>
@@ -223,6 +240,26 @@ export default function ExecutorNodesPanel({ ctx, nodesInfo, onChanged, embedded
                   <td>{n.vcat_version || "—"}</td>
                   <td>
                     <div className="button-row">
+                      {n.active_promoter_user_id && !n.active_promoter_activated && n.status === "online" && (
+                        <button
+                          type="button"
+                          className="primary"
+                          onClick={() => {
+                            if (onActivateNode) {
+                              onActivateNode(String(n.id));
+                            } else {
+                              try {
+                                sessionStorage.setItem("pending_activate_node", String(n.id));
+                              } catch {
+                                // ignore storage errors
+                              }
+                              ctx.go("ops-accounts");
+                            }
+                          }}
+                        >
+                          激活并导入
+                        </button>
+                      )}
                       {isAdmin && n.status !== "revoked" && !n.is_default && (
                         <button
                           type="button"

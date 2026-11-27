@@ -294,7 +294,7 @@ export default function App() {
                     <div className="exec-popover" role="dialog" aria-label="执行器实时状态面板">
                       <div className="exec-popover-head">
                         <div>
-                          <strong>小V猫执行器实时状态</strong>
+                          <strong>渠道推广器执行器实时状态</strong>
                           <small className="muted">
                             当前模式：{EXECUTOR_MODES[modeKey] || modeKey}
                           </small>
@@ -307,6 +307,25 @@ export default function App() {
                           关闭
                         </button>
                       </div>
+                      {(execInfo?.pending_promoter_activations || []).length > 0 && (
+                        <div className="ops-pending-banner" style={{ marginBottom: 10, padding: "8px 10px" }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                            <small>
+                              发现 {(execInfo?.pending_promoter_activations || []).length} 个未激活渠道推广器账号
+                            </small>
+                            <button
+                              type="button"
+                              className="text-button primary-text"
+                              onClick={() => {
+                                setExecOpen(false);
+                                go("ops-accounts");
+                              }}
+                            >
+                              去激活并导入
+                            </button>
+                          </div>
+                        </div>
+                      )}
                       {me.role === "admin" && (
                         <div className="mode-switcher exec-popover-modes">
                           {["server_direct", "server_relay", "client_local", "hybrid", "manual"].map(

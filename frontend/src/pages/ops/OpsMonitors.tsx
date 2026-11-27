@@ -41,7 +41,7 @@ export default function OpsMonitors(c: Ctx) {
     <>
       <Notice>
         {notice ||
-          "监控告警中心聚合账号异常、小V猫监控任务、作品流速报告与视频号违规作品检查；违规作品支持隐藏为仅自己可见，删除作品功能本期「暂不开放」。"}
+          "监控告警中心聚合账号异常、渠道推广器监控任务、作品流速报告与视频号违规作品检查；违规作品支持隐藏为仅自己可见，删除作品功能本期「暂不开放」。"}
       </Notice>
 
       <Card
@@ -89,7 +89,7 @@ export default function OpsMonitors(c: Ctx) {
         )}
       </Card>
 
-      <Card title={`小V猫监控任务 · ${monitors.length}`}>
+      <Card title={`渠道推广器监控任务 · ${monitors.length}`}>
         {monitors.length ? (
           <div className="table-scroll">
             <table>
@@ -136,7 +136,7 @@ export default function OpsMonitors(c: Ctx) {
             </table>
           </div>
         ) : (
-          <Empty title="暂无小V猫监控任务" body="如需启停监控任务，请先在小V猫桌面端建立基础监控配置。" />
+          <Empty title="暂无渠道推广器监控任务" body="如需启停监控任务，请先在渠道推广器桌面端建立基础监控配置。" />
         )}
       </Card>
 
@@ -165,7 +165,7 @@ export default function OpsMonitors(c: Ctx) {
             </table>
           </div>
         ) : (
-          <Empty title="暂无流速报告数据" body="小V猫暂未配置或采集作品流速样本。" />
+          <Empty title="暂无流速报告数据" body="渠道推广器暂未配置或采集作品流速样本。" />
         )}
       </Card>
 

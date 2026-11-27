@@ -212,14 +212,14 @@ export default function OpsPosts(c: Ctx) {
               </table>
             </div>
           ) : (
-            <Empty title="暂无分日数据" body="小V猫尚未返回该作品的分日增量明细。" />
+            <Empty title="暂无分日数据" body="渠道推广器尚未返回该作品的分日增量明细。" />
           )}
         </Modal>
       )}
 
       {visibleTarget && (
         <Modal title={`修改作品可见性 · ${visibleTarget.title || visibleTarget.vendor_post_id}`} onClose={() => setVisibleTarget(null)}>
-          <Notice>将向小V猫下发单条可见性调整任务，把该作品设为「仅自己可见」。</Notice>
+          <Notice>将向渠道推广器下发单条可见性调整任务，把该作品设为「仅自己可见」。</Notice>
           <div className="button-row">
             <button
               className="primary"

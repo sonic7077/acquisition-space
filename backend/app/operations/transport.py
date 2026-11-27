@@ -371,13 +371,13 @@ class DirectHttpMcpTransport:
                 error_message=err_msg,
             )
         except httpx.TimeoutException as exc:
-            return VcatActionResult(cmd.action_id, False, "TIMEOUT", error_message=f"MCP调用超时: {exc}")
+            return VcatActionResult(cmd.action_id, False, "TIMEOUT", error_message=f"渠道推广器服务调用超时: {exc}")
         except httpx.ConnectError as exc:
-            return VcatActionResult(cmd.action_id, False, "NODE_OFFLINE", error_message=f"无法连接小V猫MCP: {exc}")
+            return VcatActionResult(cmd.action_id, False, "NODE_OFFLINE", error_message=f"无法连接渠道推广器本地服务: {exc}")
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in (401, 403):
-                return VcatActionResult(cmd.action_id, False, "NODE_OFFLINE", error_message="小V猫MCP令牌无效或未开启服务")
-            return VcatActionResult(cmd.action_id, False, "UNKNOWN", error_message=f"MCP返回HTTP {exc.response.status_code}")
+                return VcatActionResult(cmd.action_id, False, "NODE_OFFLINE", error_message="渠道推广器服务令牌无效或未开启服务")
+            return VcatActionResult(cmd.action_id, False, "UNKNOWN", error_message=f"渠道推广器服务返回HTTP {exc.response.status_code}")
         except Exception as exc:
             return VcatActionResult(cmd.action_id, False, "UNKNOWN", error_message=str(exc))
 
@@ -510,7 +510,7 @@ class AgentRelayMcpTransport:
                     action_id=cmd.action_id,
                     ok=False,
                     status="NODE_OFFLINE",
-                    error_message="执行节点不在线或小V猫未就绪，请先确认节点在线",
+                    error_message="执行节点不在线或渠道推广器未就绪，请先确认节点在线",
                 )
             existing = db.scalar(select(AgentCommand).where(AgentCommand.action_id == cmd.action_id))
             if not existing:
@@ -596,7 +596,7 @@ class TransportRouter:
         if not node:
             node = ExecutorNode(
                 id="server-direct-default",
-                name="本地直连兜底小V猫",
+                name="本地直连兜底渠道推广器",
                 node_scope="server_direct",
                 owner_user_id=None,
                 transport_mode="direct_http",
@@ -634,13 +634,13 @@ class TransportRouter:
                 raise ValueError("执行节点已吊销，请重新配对")
             if node.node_scope == "client_local" and actor is not None:
                 if actor.role != "admin" and node.owner_user_id != actor.id:
-                    raise PermissionError("只能操作绑定到本人账号的本机小V猫节点")
+                    raise PermissionError("只能操作绑定到本人账号的本机渠道推广器节点")
             return node
 
         if default_mode == "server_direct":
             node = self.ensure_direct_node(db)
             if not node.token_encrypted:
-                raise ValueError("服务器直连模式未配置小V猫 MCP 令牌")
+                raise ValueError("服务器直连模式未配置渠道推广器访问令牌")
             return node
 
         if default_mode == "client_local":
@@ -656,7 +656,7 @@ class TransportRouter:
                 .order_by(ExecutorNode.last_heartbeat_at.desc())
             )
             if not node:
-                raise ValueError("当前账号尚未配对本机小V猫代理")
+                raise ValueError("当前账号尚未配对本机渠道推广器代理")
             return node
 
         if default_mode in ("server_relay", "hybrid"):
@@ -727,7 +727,7 @@ class TransportRouter:
                     if cn:
                         return cn
 
-        raise ValueError("当前未启用可执行的小V猫节点，请先在系统设置中配置执行器模式")
+        raise ValueError("当前未启用可执行的渠道推广器节点，请先在系统设置中配置执行器模式")
 
     def transport_for(self, db, node: ExecutorNode, *, sync_wait_sec: float = 20.0) -> McpExecutionTransport:
         if node.transport_mode == "direct_http":

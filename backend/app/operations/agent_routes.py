@@ -13,13 +13,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from ..db import AgentCommand, AgentPairCode, ExecutorNode, Record, now, uid
+from .promoter_probe import apply_promoter_identity_to_node
 from .transport import RelayEventBus, sanitize_summary
 
 
 class AgentRegisterInput(BaseModel):
     pair_code: str = Field(min_length=1, max_length=200)
-    node_name: str = Field(default="小V猫执行节点", max_length=80)
+    node_name: str = Field(default="渠道推广器执行节点", max_length=80)
     vcat_version: str = Field(default="3.1.0", max_length=40)
+    promoter_identity: dict[str, Any] | None = None
 
 
 class AgentHeartbeatInput(BaseModel):
@@ -27,6 +29,7 @@ class AgentHeartbeatInput(BaseModel):
     vcat_version: str = Field(default="3.1.0", max_length=40)
     capabilities: dict[str, Any] = Field(default_factory=dict)
     node_name: str | None = Field(default=None, max_length=80)
+    promoter_identity: dict[str, Any] | None = None
 
 
 class AgentResultInput(BaseModel):
@@ -101,6 +104,8 @@ def register_agent_routes(app):
             )
             pair.used_at = now()
             db.add(node)
+            db.flush()
+            promo_info = apply_promoter_identity_to_node(db, node, data.promoter_identity)
             db.commit()
             return {
                 "node_id": node.id,
@@ -108,6 +113,7 @@ def register_agent_routes(app):
                 "node_scope": node.node_scope,
                 "owner_user_id": node.owner_user_id,
                 "node_secret": raw_secret,
+                **promo_info,
             }
 
     @app.post("/internal/agents/heartbeat")
@@ -129,9 +135,10 @@ def register_agent_routes(app):
                 merged_caps = dict(row.capabilities_json or {})
                 merged_caps.update(data.capabilities)
                 row.capabilities_json = merged_caps
+            promo_info = apply_promoter_identity_to_node(db, row, data.promoter_identity)
             row.updated_at = now()
             db.commit()
-            return {"ok": True, "node_id": row.id, "node_name": row.name, "status": row.status}
+            return {"ok": True, "node_id": row.id, "node_name": row.name, "status": row.status, **promo_info}
 
     @app.post("/internal/agents/poll")
     def poll_command(wait: float = 0.0, node: ExecutorNode = Depends(agent_auth)):

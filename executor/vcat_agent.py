@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Unified Xiaovmao execution agent for both server_managed and client_local modes.
+"""Unified channel-promoter execution agent for both server_managed and client_local modes.
 
-Runs on the machine where Xiaovmao Desktop is installed, polls outbound commands
-from acquisition-space, downloads and SHA-256 verifies media assets, invokes
-local http://127.0.0.1:3199/mcp with rate limiting, and posts results back.
+Runs on the machine where the local channel promoter desktop client is installed,
+polls outbound commands from acquisition-space, downloads and SHA-256 verifies
+media assets, invokes local http://127.0.0.1:3199/mcp with rate limiting,
+and posts results back.
 """
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
@@ -18,6 +20,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -44,6 +47,7 @@ ALLOWED_AGENT_TOOLS = {
     "vcat_list_monitor_tasks",
     "vcat_get_flow_report",
     "vcat_list_punish_feeds",
+    "vcat_list_verify_results",
     "vcat_list_login_links",
     "vcat_get_verify_links",
     "vcat_list_duplicate_accounts",
@@ -69,6 +73,225 @@ ALLOWED_AGENT_TOOLS = {
     "vcat_hide_punish_post",
     "vcat_create_update_visible_single_task",
 }
+
+_RAW_MOBILE_RE = re.compile(r"(?<!\d)(1[3-9]\d)(\d{4})(\d{4})(?!\d)")
+_MASKED_MOBILE_RE = re.compile(r"(?<!\d)(1[3-9]\d\*{4}\d{4})(?!\d)")
+
+
+def mask_mobile_text(raw: Any) -> str | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    m_raw = _RAW_MOBILE_RE.search(text)
+    if m_raw:
+        return f"{m_raw.group(1)}****{m_raw.group(3)}"
+    m_masked = _MASKED_MOBILE_RE.search(text)
+    if m_masked:
+        return m_masked.group(1)
+    return None
+
+
+def _sanitize_username_or_mobile(raw: Any) -> tuple[str | None, str | None]:
+    if raw is None or isinstance(raw, bool):
+        return None, None
+    text = str(raw).strip()
+    if not text:
+        return None, None
+    masked = mask_mobile_text(text)
+    if masked and _RAW_MOBILE_RE.fullmatch(text):
+        return None, masked
+    if masked:
+        return _RAW_MOBILE_RE.sub(lambda m: f"{m.group(1)}****{m.group(3)}", text), masked
+    return text, None
+
+
+def build_promoter_display_label(
+    *,
+    remark: str | None = "",
+    nickname: str | None = "",
+    username: str | None = "",
+    masked_mobile: str | None = "",
+    external_user_id: str | None = "",
+) -> str:
+    clean_remark = (remark or "").strip()
+    if clean_remark:
+        return clean_remark
+    clean_nick = _RAW_MOBILE_RE.sub(lambda m: f"{m.group(1)}****{m.group(3)}", (nickname or "").strip())
+    clean_user, extracted_mobile = _sanitize_username_or_mobile(username)
+    clean_mobile = mask_mobile_text(masked_mobile) or extracted_mobile
+    if clean_nick:
+        if clean_mobile and clean_mobile not in clean_nick:
+            return f"{clean_nick}（{clean_mobile}）"
+        return clean_nick
+    if clean_user:
+        if clean_mobile and clean_mobile not in clean_user:
+            return f"{clean_user}（{clean_mobile}）"
+        return clean_user
+    if clean_mobile:
+        return clean_mobile
+    ext = (external_user_id or "").strip()
+    return f"渠道推广器 #{ext}" if ext else "未命名渠道推广器"
+
+
+def _read_local_user_db(db_path: Path) -> dict[str, Any] | None:
+    try:
+        con = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=1.0)
+    except Exception:
+        return None
+    try:
+        cur = con.cursor()
+        cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(user)").fetchall()}
+        if not cols or "user_id" not in cols:
+            return None
+        want = [c for c in ("user_id", "sub_id", "name", "nickname", "avatar", "lastLogin", "phone", "mobile") if c in cols]
+        row = cur.execute(f"SELECT {', '.join(want)} FROM user LIMIT 1").fetchone()
+        if not row:
+            return None
+        data = dict(zip(want, row))
+        ext_uid = str(data.get("user_id") or "").strip()
+        if not ext_uid:
+            return None
+        sub_val = data.get("sub_id")
+        ext_sub = str(sub_val).strip() if sub_val not in (None, "") else None
+        raw_nick = str(data.get("nickname") or "").strip()
+        safe_nick = _RAW_MOBILE_RE.sub(lambda m: f"{m.group(1)}****{m.group(3)}", raw_nick)
+        safe_username, mobile_from_name = _sanitize_username_or_mobile(data.get("name"))
+        masked_mobile = (
+            mask_mobile_text(data.get("phone"))
+            or mask_mobile_text(data.get("mobile"))
+            or mask_mobile_text(raw_nick)
+            or mobile_from_name
+        )
+        display_label = build_promoter_display_label(
+            nickname=safe_nick,
+            username=safe_username,
+            masked_mobile=masked_mobile,
+            external_user_id=ext_uid,
+        )
+        return {
+            "external_user_id": ext_uid,
+            "external_sub_id": ext_sub,
+            "nickname": safe_nick or safe_username or f"渠道推广器 #{ext_uid}",
+            "username": safe_username,
+            "masked_mobile": masked_mobile,
+            "display_label": display_label,
+            "avatar": str(data.get("avatar") or "") or None,
+            "last_login": str(data.get("lastLogin") or "") or None,
+        }
+    except Exception:
+        return None
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def detect_local_promoter_state(provider: str = "vcat", data_home: Path | str | None = None) -> dict[str, Any]:
+    clean_provider = (provider or "vcat").strip().lower() or "vcat"
+    empty = {"detected": False, "provider": clean_provider, "active_account": None, "known_accounts": []}
+    if clean_provider != "vcat":
+        return empty
+    raw_home = data_home or os.environ.get("PROMOTER_DATA_HOME") or os.environ.get("VCAT_HOME")
+    base = Path(raw_home).expanduser() if raw_home else (Path.home() / ".vcat")
+    if not base.is_dir():
+        return empty
+
+    cfg: dict[str, Any] = {}
+    cfg_path = base / "local.config"
+    if cfg_path.is_file():
+        try:
+            parsed = json.loads(cfg_path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(parsed, dict):
+                cfg = parsed
+        except Exception:
+            cfg = {}
+
+    mcp_setting = cfg.get("mcp-setting") if isinstance(cfg.get("mcp-setting"), dict) else {}
+    active_uid_raw = mcp_setting.get("userId") or cfg.get("Login_default_id")
+    active_uid = str(active_uid_raw).strip() if active_uid_raw not in (None, "") else None
+    write_modules = mcp_setting.get("writeModules") if isinstance(mcp_setting.get("writeModules"), dict) else {}
+    service_enabled = bool(mcp_setting.get("enabled", False))
+    service_port = int(mcp_setting.get("port") or 3199) if str(mcp_setting.get("port") or "").isdigit() else 3199
+
+    known_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    try:
+        entries = sorted(base.iterdir(), key=lambda p: p.name)
+    except OSError:
+        entries = []
+    for child in entries:
+        if not child.is_dir():
+            continue
+        db_file = child / "vcat.db"
+        if not db_file.is_file():
+            continue
+        info = _read_local_user_db(db_file)
+        if info:
+            known_by_key[(info["external_user_id"], info.get("external_sub_id") or "")] = info
+
+    if not known_by_key and not active_uid:
+        return empty
+
+    known_accounts: list[dict[str, Any]] = []
+    active_account: dict[str, Any] | None = None
+    for info in known_by_key.values():
+        is_active = bool(active_uid and info["external_user_id"] == active_uid)
+        known_accounts.append(
+            {
+                "external_user_id": info["external_user_id"],
+                "external_sub_id": info.get("external_sub_id"),
+                "nickname": info["nickname"],
+                "username": info.get("username"),
+                "masked_mobile": info.get("masked_mobile"),
+                "display_label": info["display_label"],
+                "is_active": is_active,
+            }
+        )
+        if is_active and active_account is None:
+            active_account = {
+                **info,
+                "service_enabled": service_enabled,
+                "service_port": service_port,
+                "write_modules": {str(k): bool(v) for k, v in write_modules.items()},
+            }
+
+    if active_account is None and active_uid:
+        label = build_promoter_display_label(external_user_id=active_uid)
+        active_account = {
+            "external_user_id": active_uid,
+            "external_sub_id": None,
+            "nickname": label,
+            "username": None,
+            "masked_mobile": None,
+            "display_label": label,
+            "avatar": None,
+            "last_login": None,
+            "service_enabled": service_enabled,
+            "service_port": service_port,
+            "write_modules": {str(k): bool(v) for k, v in write_modules.items()},
+        }
+        known_accounts.insert(
+            0,
+            {
+                "external_user_id": active_uid,
+                "external_sub_id": None,
+                "nickname": label,
+                "username": None,
+                "masked_mobile": None,
+                "display_label": label,
+                "is_active": True,
+            },
+        )
+
+    known_accounts.sort(key=lambda x: (not x["is_active"], str(x.get("display_label") or ""), str(x["external_user_id"])))
+    return {
+        "detected": bool(active_account or known_accounts),
+        "provider": clean_provider,
+        "active_account": active_account,
+        "known_accounts": known_accounts,
+    }
 
 
 def _parse_mcp_response(content_type: str, text: str) -> dict[str, Any]:
@@ -128,6 +351,8 @@ class VcatAgentRunner:
         explicit_node_name: bool = False,
         min_interval_sec: float = 3.2,
         poll_wait: float | None = None,
+        provider: str = "vcat",
+        data_home: Path | str | None = None,
         server_http_client: httpx.Client | None = None,
         mcp_http_client: httpx.Client | None = None,
     ) -> None:
@@ -145,12 +370,20 @@ class VcatAgentRunner:
         self.node_id = node_id
         self.min_interval_sec = min_interval_sec
         self.poll_wait = (0.0 if server_http_client is not None else 25.0) if poll_wait is None else max(0.0, float(poll_wait))
+        self.provider = (provider or "vcat").strip().lower() or "vcat"
+        self.data_home = Path(data_home).expanduser() if data_home else None
         self._last_mcp_ts = 0.0
         self._mcp_session_id: str | None = None
         self._req_id = 0
         self._server_client = server_http_client
         self._mcp_client = mcp_http_client
         self.last_mcp_ready = False
+        self.last_promoter_identity: dict[str, Any] = {"detected": False, "provider": self.provider, "active_account": None, "known_accounts": []}
+        self.promoter_activated: bool = False
+        self.promoter_account_id: str | None = None
+        self.promoter_account_label: str | None = None
+        self.activation_url: str | None = None
+        self._last_logged_promoter_sig: tuple[Any, ...] | None = None
 
         saved: dict[str, Any] = {}
         if self.creds_path.is_file():
@@ -212,18 +445,44 @@ class VcatAgentRunner:
         with httpx.Client(base_url=self.server_url, timeout=60, follow_redirects=False, trust_env=False) as c:
             return c.get(path, headers=self._srv_headers(), params=params)
 
-    def register(self, pair_code: str, node_name: str) -> dict[str, Any]:
-        if self._server_client is not None:
-            resp = self._server_client.post(
-                "/internal/agents/register",
-                json={"pair_code": pair_code, "node_name": node_name, "vcat_version": "3.1.0"},
+    def probe_promoter_identity(self) -> dict[str, Any]:
+        identity = detect_local_promoter_state(provider=self.provider, data_home=self.data_home)
+        self.last_promoter_identity = identity
+        return identity
+
+    def _sync_promoter_response(self, data: dict[str, Any], logger: logging.Logger | None = None) -> None:
+        self.promoter_activated = bool(data.get("promoter_activated", False))
+        self.promoter_account_id = data.get("promoter_account_id")
+        self.promoter_account_label = data.get("promoter_account_label")
+        self.activation_url = data.get("activation_url")
+        active = self.last_promoter_identity.get("active_account") if isinstance(self.last_promoter_identity, dict) else None
+        ext_uid = active.get("external_user_id") if isinstance(active, dict) else None
+        label = self.promoter_account_label or (active.get("display_label") if isinstance(active, dict) else None)
+        sig = (ext_uid, label, self.promoter_activated)
+        if ext_uid and sig != self._last_logged_promoter_sig:
+            self._last_logged_promoter_sig = sig
+            msg = (
+                f"当前渠道推广器账号：{label}（ID: {ext_uid}）· "
+                + ("已激活" if self.promoter_activated else f"尚未在获客空间激活，请前往 {self.server_url}{self.activation_url or '/#ops-accounts'} 点击激活并导入")
             )
+            if logger:
+                logger.info(msg)
+            else:
+                print(msg, flush=True)
+
+    def register(self, pair_code: str, node_name: str) -> dict[str, Any]:
+        identity = self.probe_promoter_identity()
+        reg_body = {
+            "pair_code": pair_code,
+            "node_name": node_name,
+            "vcat_version": "3.1.0",
+            "promoter_identity": identity,
+        }
+        if self._server_client is not None:
+            resp = self._server_client.post("/internal/agents/register", json=reg_body)
         else:
             with httpx.Client(base_url=self.server_url, timeout=20, follow_redirects=False, trust_env=False) as c:
-                resp = c.post(
-                    "/internal/agents/register",
-                    json={"pair_code": pair_code, "node_name": node_name, "vcat_version": "3.1.0"},
-                )
+                resp = c.post("/internal/agents/register", json=reg_body)
         resp.raise_for_status()
         data = resp.json()
         self.node_id = data["node_id"]
@@ -231,6 +490,7 @@ class VcatAgentRunner:
         self.node_name = str(data.get("node_name") or node_name).strip()
         self.configured_node_name = str(node_name or self.node_name).strip()
         self._pending_name_sync = False
+        self._sync_promoter_response(data)
         self._save_credentials()
         return data
 
@@ -283,6 +543,7 @@ class VcatAgentRunner:
 
     def heartbeat_once(self) -> dict[str, Any]:
         ready, caps = self.probe_local_mcp()
+        identity = self.probe_promoter_identity()
         caps = {
             **caps,
             "channel": "long_poll" if self.poll_wait > 0 else "short_poll",
@@ -294,6 +555,7 @@ class VcatAgentRunner:
             "mcp_ready": ready,
             "vcat_version": caps.get("server_version", "3.1.0"),
             "capabilities": caps,
+            "promoter_identity": identity,
         }
         if self._pending_name_sync and self.node_name:
             payload["node_name"] = self.node_name
@@ -308,6 +570,7 @@ class VcatAgentRunner:
         if srv_name and srv_name != self.node_name:
             self.node_name = srv_name
             changed = True
+        self._sync_promoter_response(data, logger=logging.getLogger("vcat_agent") if logging.getLogger("vcat_agent").handlers else None)
         if changed and self.node_secret:
             self._save_credentials()
         return data
@@ -406,7 +669,7 @@ class VcatAgentRunner:
                     "error_message": str(payload) if is_err else None,
                 }
         except httpx.TimeoutException as exc:
-            res = {"ok": False, "status": "UNKNOWN", "payload": None, "error_message": f"本机MCP超时: {exc}"}
+            res = {"ok": False, "status": "UNKNOWN", "payload": None, "error_message": f"本机渠道推广器服务超时: {exc}"}
         except Exception as exc:
             res = {"ok": False, "status": "FAILED", "payload": None, "error_message": str(exc)}
 
@@ -415,16 +678,84 @@ class VcatAgentRunner:
         return True
 
 
+def _build_local_status_html(runner: VcatAgentRunner) -> str:
+    ident = runner.last_promoter_identity if isinstance(runner.last_promoter_identity, dict) else {}
+    active = ident.get("active_account") if isinstance(ident.get("active_account"), dict) else None
+    known = ident.get("known_accounts") if isinstance(ident.get("known_accounts"), list) else []
+    display_label = (
+        runner.promoter_account_label
+        or (active.get("display_label") if active else None)
+        or "未检测到登录中的渠道推广器账号"
+    )
+    ext_uid = (active.get("external_user_id") if active else None) or ""
+    act_href = f"{runner.server_url}{runner.activation_url}" if runner.activation_url else f"{runner.server_url}/#ops-accounts"
+    banner = (
+        '<div class="banner ok">当前渠道推广器账号已在获客空间激活，可正常同步与执行任务。</div>'
+        if runner.promoter_activated
+        else (
+            f'<div class="banner warn"><strong>检测到未激活的渠道推广器账号：</strong>'
+            f'{html.escape(display_label)}'
+            f' <a class="btn" href="{html.escape(act_href)}" target="_blank" rel="noreferrer">前往获客空间激活并导入 →</a></div>'
+            if ext_uid
+            else '<div class="banner">未在本机探测到渠道推广器账号元数据，可在获客空间页面手动添加节点并导入。</div>'
+        )
+    )
+    known_rows = "".join(
+        f"<li><strong>{html.escape(str(item.get('display_label') or item.get('nickname') or '未命名'))}</strong>"
+        f" <small>(ID: {html.escape(str(item.get('external_user_id') or '-'))})</small>"
+        f"{' <span class=\"tag\">当前登录</span>' if item.get('is_active') else ''}</li>"
+        for item in known
+        if isinstance(item, dict)
+    ) or "<li>暂未发现本机历史渠道推广器账号</li>"
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>本机渠道推广器代理状态</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:760px;margin:32px auto;padding:0 16px;color:#1e293b;background:#f8fafc}}
+.card{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px;margin-bottom:16px}}
+.banner{{padding:12px 14px;border-radius:10px;border:1px solid #cbd5e1;background:#f1f5f9;margin-bottom:16px;line-height:1.6}}
+.banner.warn{{border-color:#f59e0b;background:#fffbeb;color:#92400e}}
+.banner.ok{{border-color:#34d399;background:#ecfdf5;color:#065f46}}
+.btn{{display:inline-block;margin-left:10px;padding:6px 12px;border-radius:8px;background:#2563eb;color:#fff;text-decoration:none;font-weight:600}}
+.tag{{display:inline-block;padding:2px 6px;border-radius:6px;background:#dbeafe;color:#1d4ed8;font-size:12px}}
+small{{color:#64748b}}
+</style></head><body>
+<h2>本机渠道推广器代理状态</h2>
+{banner}
+<div class="card">
+  <p><strong>代理节点：</strong>{html.escape(runner.node_name or '未命名')} <small>({html.escape(runner.node_id or '-')})</small></p>
+  <p><strong>本地服务状态：</strong>{'就绪' if runner.last_mcp_ready else '未连接或未启用'}</p>
+  <p><strong>当前渠道推广器账号：</strong>{html.escape(display_label)}{f' <small>(ID: {html.escape(ext_uid)})</small>' if ext_uid else ''}</p>
+  <p><strong>获客空间地址：</strong><a href="{html.escape(runner.server_url)}" target="_blank" rel="noreferrer">{html.escape(runner.server_url)}</a></p>
+</div>
+<div class="card">
+  <h3>本机已发现的渠道推广器账号（{len(known)}）</h3>
+  <ul>{known_rows}</ul>
+</div>
+</body></html>"""
+
+
 def _start_local_health_server(runner: VcatAgentRunner, allowed_origin: str, port: int = 18899) -> ThreadingHTTPServer | None:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
             return
 
         def do_GET(self) -> None:
+            if self.path == "/":
+                body = _build_local_status_html(runner).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path != "/health":
                 self.send_response(404)
                 self.end_headers()
                 return
+            ident = runner.last_promoter_identity if isinstance(runner.last_promoter_identity, dict) else {}
+            active = ident.get("active_account") if isinstance(ident.get("active_account"), dict) else None
+            known = ident.get("known_accounts") if isinstance(ident.get("known_accounts"), list) else []
             body = json.dumps(
                 {
                     "agent_online": True,
@@ -432,6 +763,15 @@ def _start_local_health_server(runner: VcatAgentRunner, allowed_origin: str, por
                     "node_id": runner.node_id,
                     "node_name": runner.node_name,
                     "mcp_ready": runner.last_mcp_ready,
+                    "promoter_provider": ident.get("provider", runner.provider),
+                    "promoter_display_label": runner.promoter_account_label or (active.get("display_label") if active else None),
+                    "promoter_nickname": active.get("nickname") if active else None,
+                    "promoter_masked_mobile": active.get("masked_mobile") if active else None,
+                    "promoter_external_user_id": active.get("external_user_id") if active else None,
+                    "promoter_activated": runner.promoter_activated,
+                    "promoter_account_id": runner.promoter_account_id,
+                    "activation_url": runner.activation_url,
+                    "known_promoter_count": len(known),
                 },
                 ensure_ascii=False,
             ).encode("utf-8")
@@ -636,7 +976,7 @@ def main() -> int:
         _load_env_file(Path(__file__).resolve().parent / "vcat_agent.env")
         _load_env_file(Path(__file__).resolve().parent.parent / ".env")
 
-    parser = argparse.ArgumentParser(description="Xiaovmao outbound execution agent", parents=[pre])
+    parser = argparse.ArgumentParser(description="Channel-promoter outbound execution agent", parents=[pre])
     parser.add_argument(
         "--mode",
         choices=["server_managed", "client_local"],
@@ -652,6 +992,8 @@ def main() -> int:
     parser.add_argument("--pair-token", default="")
     parser.add_argument("--register-only", action="store_true", help="Register credentials, persist env, and exit")
     parser.add_argument("--node-name", default=os.environ.get("VCAT_NODE_NAME", ""))
+    parser.add_argument("--provider", default=os.environ.get("PROMOTER_PROVIDER", "vcat"))
+    parser.add_argument("--data-home", "--vcat-home", dest="data_home", default=os.environ.get("PROMOTER_DATA_HOME", os.environ.get("VCAT_HOME", "")))
     parser.add_argument("--poll-wait", type=float, default=float(os.environ.get("VCAT_POLL_WAIT", "25")))
     parser.add_argument(
         "--state-dir",
@@ -667,7 +1009,7 @@ def main() -> int:
     persist_agent_env(state_dir, args.server, sync_user_env=True)
 
     if not args.mcp_token and not (args.register_only and args.pair_token):
-        print("请通过 --mcp-token 或环境变量 VCAT_MCP_TOKEN 提供本机小V猫 MCP 令牌", file=sys.stderr)
+        print("请通过 --mcp-token 或环境变量 VCAT_MCP_TOKEN 提供本机渠道推广器服务令牌", file=sys.stderr)
         return 2
 
     cli_node_name_provided = any(arg == "--node-name" or arg.startswith("--node-name=") for arg in sys.argv[1:])
@@ -680,6 +1022,8 @@ def main() -> int:
         node_name=(args.node_name or "").strip(),
         explicit_node_name=cli_node_name_provided,
         poll_wait=args.poll_wait,
+        provider=args.provider,
+        data_home=args.data_home or None,
     )
     if args.pair_token:
         runner.register(args.pair_token, (args.node_name or "").strip() or "niekun")

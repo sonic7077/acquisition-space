@@ -100,7 +100,7 @@ export default function AgentDeployModal({ ctx, onClose, onDone }: Props) {
       const resp = await fetch("http://127.0.0.1:18899/health", { signal: ctrl.signal });
       const data = await resp.json();
       setHealthResult(
-        `本机 Agent 在线 · 名称=${data.node_name || "未命名"} · 节点=${data.node_id || "未知"} · 小V猫=${data.mcp_ready ? "就绪" : "未连接"}`,
+        `本机 Agent 在线 · 名称=${data.node_name || "未命名"} · 节点=${data.node_id || "未知"} · 渠道推广器=${data.mcp_ready ? "就绪" : "未连接"}${data.promoter_display_label ? `（${data.promoter_display_label}）` : ""}`,
       );
     } catch {
       setHealthResult("未检测到运行中的本机 Agent（127.0.0.1:18899 无响应）");
@@ -117,7 +117,7 @@ export default function AgentDeployModal({ ctx, onClose, onDone }: Props) {
   });
 
   return (
-    <Modal title="部署 / 启动小V猫 Agent 服务" onClose={onClose}>
+    <Modal title="部署 / 启动渠道推广器 Agent 服务" onClose={onClose}>
       <div className="deploy-tabs">
         <button
           type="button"

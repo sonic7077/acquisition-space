@@ -465,7 +465,7 @@ if (Test-Path $EnvFile) {{
   }}
 }}
 if (-not $ExistingToken) {{
-  $ExistingToken = Read-Host "请输入本机小V猫 MCP 令牌 (VCAT_MCP_TOKEN，可在小V猫客户端开启会员态 MCP 后复制)"
+  $ExistingToken = Read-Host "请输入本机渠道推广器服务令牌 (VCAT_MCP_TOKEN，可在本地客户端开启服务后复制)"
 }}
 @"
 VCAT_SERVER_URL=$ServerUrl
@@ -555,7 +555,7 @@ if [ -z "$MCP_TOK" ] && [ -f "$ENV_FILE" ]; then
   MCP_TOK="$(grep -E '^VCAT_MCP_TOKEN=' "$ENV_FILE" | head -n1 | cut -d= -f2- || true)"
 fi
 if [ -z "$MCP_TOK" ]; then
-  read -r -p "请输入本机小V猫 MCP 令牌 (VCAT_MCP_TOKEN): " MCP_TOK
+  read -r -p "请输入本机渠道推广器服务令牌 (VCAT_MCP_TOKEN): " MCP_TOK
 fi
 
 cat > "$ENV_FILE" <<EOF

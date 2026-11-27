@@ -20,6 +20,7 @@ from ..db import (
     ExecutorNode,
     MetricSnapshot,
     PlatformAccount,
+    PromoterAccount,
     PublishAttempt,
     PublishTarget,
     PublishedPost,
@@ -41,6 +42,13 @@ from .agent_installer import (
     resolve_agent_download_urls,
     try_start_local_agent,
     validate_download_urls,
+)
+from .promoter_probe import (
+    apply_promoter_identity_to_node,
+    build_promoter_display_label,
+    detect_local_promoter_state,
+    find_promoter_account,
+    mask_mobile_text,
 )
 from .qr import render_qr_png
 from .transport import (
@@ -109,6 +117,120 @@ def _parse_iso(ts: str | None) -> datetime | None:
         return None
 
 
+def _clean_legacy_login_status(status: str | None) -> str:
+    raw = str(status or "未知")
+    legacy_brand = "\u5c0fV\u732b"
+    if legacy_brand in raw:
+        return raw.replace(legacy_brand, "渠道推广器")
+    return raw
+
+
+def _promoter_display_label(pa: PromoterAccount) -> str:
+    return build_promoter_display_label(
+        remark=pa.remark,
+        nickname=pa.nickname,
+        username=pa.username,
+        masked_mobile=pa.masked_mobile,
+        external_user_id=pa.external_user_id,
+    )
+
+
+def _effective_node_status(n: ExecutorNode, *, active_poll: bool = False) -> str:
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+    effective_status = n.status
+    if n.status == "revoked":
+        effective_status = "revoked"
+    elif active_poll and n.status != "mcp_error":
+        effective_status = "online"
+    elif n.transport_mode == "direct_http" and not n.token_encrypted:
+        effective_status = "offline"
+    elif n.transport_mode == "agent_relay" and (not n.last_heartbeat_at or n.last_heartbeat_at < cutoff):
+        effective_status = "offline"
+    return effective_status
+
+
+def _promoter_runtime_status(
+    pa: PromoterAccount,
+    node: ExecutorNode | None,
+    *,
+    active_poll: bool = False,
+) -> tuple[str, str]:
+    if pa.status != "active":
+        return "offline", "该渠道推广器账号已在平台停用"
+    if not node or node.status == "revoked":
+        return "offline", "关联执行节点不存在或已吊销"
+    eff = _effective_node_status(node, active_poll=active_poll)
+    if eff == "mcp_error":
+        return "service_error", "执行节点在线，但本机渠道推广器服务异常或未登录会员"
+    if eff != "online":
+        return "offline", "执行节点离线或未配置访问令牌"
+    if pa.identity_source == "local_probe" and pa.external_user_id and node.active_promoter_user_id:
+        if (pa.external_user_id, pa.external_sub_id or "") != (node.active_promoter_user_id, node.active_promoter_sub_id or ""):
+            cur_label = node.active_promoter_label or f"渠道推广器 #{node.active_promoter_user_id}"
+            return "switched_away", f"当前节点已切换为另一账号（{cur_label}），请先切回后再操作"
+    return "online_active", "渠道推广器在线且已激活"
+
+
+def _account_availability(
+    a: PlatformAccount,
+    pa: PromoterAccount | None,
+    node: ExecutorNode | None,
+    *,
+    active_poll: bool = False,
+) -> tuple[str, str]:
+    if not a.active:
+        return "removed", "已在渠道推广器移除，仅保留本地历史与审计"
+    if pa is not None:
+        rt, reason = _promoter_runtime_status(pa, node, active_poll=active_poll)
+        if rt == "switched_away":
+            return "promoter_switched", reason
+        if rt in ("offline", "service_error"):
+            return "node_offline", f"{reason}（当前仅展示本地缓存）"
+    elif not node or _effective_node_status(node, active_poll=active_poll) != "online":
+        return "node_offline", "所属执行节点当前离线或服务异常（当前仅展示本地缓存）"
+    if (a.login_status or "") == "登录有效":
+        return "ready", "渠道推广器在线且平台账号登录有效"
+    return "platform_expired", f"平台账号状态为「{_clean_legacy_login_status(a.login_status)}」，建议重新扫码登录"
+
+
+def _promoter_dict(
+    pa: PromoterAccount,
+    node: ExecutorNode | None = None,
+    *,
+    account_count: int = 0,
+    active_poll: bool = False,
+) -> dict[str, Any]:
+    rt, reason = _promoter_runtime_status(pa, node, active_poll=active_poll)
+    return {
+        "id": pa.id,
+        "provider": pa.provider,
+        "external_user_id": pa.external_user_id,
+        "external_sub_id": pa.external_sub_id,
+        "nickname": pa.nickname,
+        "username": pa.username,
+        "masked_mobile": pa.masked_mobile,
+        "remark": pa.remark or "",
+        "display_label": _promoter_display_label(pa),
+        "avatar": pa.avatar,
+        "node_id": pa.node_id,
+        "node_name": node.name if node else None,
+        "node_scope": node.node_scope if node else None,
+        "owner_scope": pa.owner_scope,
+        "owner_user_id": pa.owner_user_id,
+        "identity_source": pa.identity_source,
+        "capabilities": pa.capabilities_json or {},
+        "status": pa.status,
+        "runtime_status": rt,
+        "runtime_reason": reason,
+        "account_count": account_count,
+        "activated_by": pa.activated_by,
+        "activated_at": pa.activated_at,
+        "last_seen_at": pa.last_seen_at,
+        "last_synced_at": pa.last_synced_at,
+        "updated_at": pa.updated_at,
+    }
+
+
 def _node_dict(
     n: ExecutorNode,
     *,
@@ -116,17 +238,11 @@ def _node_dict(
     active_poll: bool = False,
     queued_commands: int = 0,
     running_commands: int = 0,
+    matched_promoter: PromoterAccount | None = None,
 ) -> dict[str, Any]:
     hb_dt = _parse_iso(n.last_heartbeat_at)
     heartbeat_age_sec = max(0, int((datetime.now(timezone.utc) - hb_dt).total_seconds())) if hb_dt else None
-    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
-    effective_status = n.status
-    if n.status == "revoked":
-        effective_status = "revoked"
-    elif active_poll and n.status != "mcp_error":
-        effective_status = "online"
-    elif n.transport_mode == "agent_relay" and (not n.last_heartbeat_at or n.last_heartbeat_at < cutoff):
-        effective_status = "offline"
+    effective_status = _effective_node_status(n, active_poll=active_poll)
 
     caps = n.capabilities_json or {}
     if n.transport_mode == "direct_http":
@@ -136,9 +252,17 @@ def _node_dict(
     else:
         channel = "short_poll"
 
+    promoter_activated = bool(matched_promoter and matched_promoter.status == "active")
+    promoter_label = (
+        _promoter_display_label(matched_promoter)
+        if matched_promoter
+        else (n.active_promoter_label or (f"渠道推广器 #{n.active_promoter_user_id}" if n.active_promoter_user_id else None))
+    )
+
     return {
         "id": n.id,
         "name": n.name,
+        "provider": n.provider or "vcat",
         "node_scope": n.node_scope,
         "owner_user_id": n.owner_user_id,
         "transport_mode": n.transport_mode,
@@ -156,24 +280,50 @@ def _node_dict(
         "vcat_version": n.vcat_version,
         "last_heartbeat_at": n.last_heartbeat_at,
         "capabilities": caps,
+        "active_promoter_user_id": n.active_promoter_user_id,
+        "active_promoter_sub_id": n.active_promoter_sub_id,
+        "active_promoter_label": promoter_label,
+        "detected_promoter_accounts": n.detected_promoter_accounts_json or [],
+        "promoter_activated": promoter_activated,
+        "promoter_account_id": matched_promoter.id if matched_promoter else None,
         "updated_at": n.updated_at,
     }
 
 
-def _account_dict(a: PlatformAccount, node: ExecutorNode | None = None) -> dict[str, Any]:
+def _account_dict(
+    a: PlatformAccount,
+    node: ExecutorNode | None = None,
+    promoter: PromoterAccount | None = None,
+    *,
+    active_poll: bool = False,
+) -> dict[str, Any]:
+    avail_status, avail_reason = _account_availability(a, promoter, node, active_poll=active_poll)
     return {
         "id": a.id,
         "node_id": a.node_id,
         "node_scope": node.node_scope if node else None,
         "node_name": node.name if node else None,
+        "promoter_account_id": a.promoter_account_id,
+        "promoter_account_label": _promoter_display_label(promoter) if promoter else (node.active_promoter_label if node else None),
+        "promoter_provider": promoter.provider if promoter else (node.provider if node else None),
+        "promoter_external_user_id": promoter.external_user_id if promoter else None,
+        "promoter_username": promoter.username if promoter else None,
+        "promoter_masked_mobile": promoter.masked_mobile if promoter else None,
         "vendor_uid": a.vendor_uid,
         "platform": a.platform,
         "platform_name": a.platform_name or PLATFORM_CN_MAP.get(a.platform, a.platform),
         "nickname": a.nickname,
         "avatar": a.avatar,
+        "source": a.source or "promoter_import",
+        "group_name": a.group_name,
+        "tags": a.tags_json or [],
+        "remark": a.remark or "",
+        "fans_total": a.fans_total,
         "team_id": a.team_id,
         "ip_id": a.ip_id,
-        "login_status": a.login_status,
+        "login_status": _clean_legacy_login_status(a.login_status),
+        "availability_status": avail_status,
+        "availability_reason": avail_reason,
         "is_verified": a.is_verified,
         "last_verified_at": a.last_verified_at,
         "verify_summary": a.verify_summary_json or {},
@@ -334,7 +484,7 @@ def _apply_remote_publish_task(
         att.state = "CANCELLED"
         target.status = "CANCELLED"
         att.verification_status = "confirmed_failed"
-        att.verification_detail = "平台/小V猫发布任务已取消"
+        att.verification_detail = "平台/渠道推广器发布任务已取消"
         return
 
     if (
@@ -388,7 +538,7 @@ def _apply_remote_publish_task(
         att.state = "ACCEPTED"
         target.status = "ACCEPTED"
         att.verification_status = "verifying"
-        att.verification_detail = "小V猫发布队列已暂停，请在小V猫客户端恢复"
+        att.verification_detail = "渠道推广器发布队列已暂停，请在客户端恢复"
         return
 
     if (
@@ -408,7 +558,7 @@ def _apply_remote_publish_task(
     att.state = "ACCEPTED"
     target.status = "ACCEPTED"
     att.verification_status = "verifying"
-    att.verification_detail = "任务已进入小V猫发布队列，等待执行上传与平台确认..."
+    att.verification_detail = "任务已进入渠道推广器发布队列，等待执行上传与平台确认..."
 
 
 class VcatOperationsService:
@@ -466,6 +616,7 @@ class VcatOperationsService:
         timeout_sec: int = 60,
         action_id: str | None = None,
     ) -> tuple[ExecutorNode, VcatActionResult]:
+        relay_bus = getattr(self.app.state, "relay_bus", None)
         with self.Session() as db:
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
             try:
@@ -474,6 +625,22 @@ class VcatOperationsService:
                 raise HTTPException(403, str(exc)) from None
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from None
+            if account_id:
+                acc_row = db.get(PlatformAccount, account_id)
+                if acc_row and acc_row.promoter_account_id:
+                    pa_row = db.get(PromoterAccount, acc_row.promoter_account_id)
+                    if pa_row:
+                        active_poll = bool(relay_bus and relay_bus.is_long_polling(node.id))
+                        rt, _ = _promoter_runtime_status(pa_row, node, active_poll=active_poll)
+                        if rt == "switched_away":
+                            cur_label = node.active_promoter_label or (
+                                f"渠道推广器 #{node.active_promoter_user_id}" if node.active_promoter_user_id else "其他账号"
+                            )
+                            target_label = _promoter_display_label(pa_row)
+                            raise HTTPException(
+                                409,
+                                f"当前节点的渠道推广器已切换为另一账号（{cur_label}），请先在客户端切回（{target_label}）后再执行该操作",
+                            )
             transport = self.router.transport_for(db, node, sync_wait_sec=sync_wait_sec)
             resolved_node_id = node.id
             db.commit()
@@ -510,13 +677,109 @@ class VcatOperationsService:
             db.commit()
             return node_row or node, res
 
-    # ---------- Nodes & Pairing ----------
+    # ---------- Nodes, Promoters & Pairing ----------
+
+    def _can_access_node(self, actor: User, node: ExecutorNode) -> bool:
+        return (
+            actor.role == "admin"
+            or node.node_scope in ("server_relay", "server_direct")
+            or (node.node_scope == "client_local" and node.owner_user_id == actor.id)
+        )
+
+    def _can_access_promoter(self, actor: User, pa: PromoterAccount, node: ExecutorNode | None) -> bool:
+        if actor.role == "admin":
+            return True
+        if pa.owner_scope == "team_shared":
+            return actor.role == "leader"
+        if pa.owner_user_id == actor.id:
+            return True
+        if node and node.node_scope == "client_local" and node.owner_user_id == actor.id:
+            return True
+        return False
+
+    def _can_manage_promoter(self, actor: User, pa: PromoterAccount, node: ExecutorNode | None) -> bool:
+        if actor.role == "admin":
+            return True
+        if pa.owner_scope == "personal" and pa.owner_user_id == actor.id:
+            return True
+        if node and node.node_scope == "client_local" and node.owner_user_id == actor.id:
+            return True
+        return False
+
+    def _refresh_direct_node_identity(self, db, node: ExecutorNode | None) -> dict[str, Any] | None:
+        if not node or node.transport_mode != "direct_http" or not node.token_encrypted:
+            return None
+        data_home = getattr(self.app.state, "promoter_data_home", None)
+        identity = detect_local_promoter_state(provider=node.provider or "vcat", data_home=data_home)
+        if identity.get("detected"):
+            apply_promoter_identity_to_node(db, node, identity)
+        return identity
+
+    def _promoter_key_map(self, db) -> dict[tuple[str, str, str], PromoterAccount]:
+        out: dict[tuple[str, str, str], PromoterAccount] = {}
+        for pa in db.scalars(select(PromoterAccount)):
+            if pa.external_user_id:
+                out[(pa.provider or "vcat", pa.external_user_id, pa.external_sub_id or "")] = pa
+        return out
+
+    def _pending_promoter_activations(
+        self,
+        actor: User,
+        nodes: list[ExecutorNode],
+        promoter_by_key: dict[tuple[str, str, str], PromoterAccount],
+        *,
+        relay_bus=None,
+    ) -> list[dict[str, Any]]:
+        pending: list[dict[str, Any]] = []
+        for n in nodes:
+            if not self._can_access_node(actor, n):
+                continue
+            if actor.role == "member" and n.node_scope != "client_local":
+                continue
+            active_poll = bool(relay_bus and relay_bus.is_long_polling(n.id))
+            if _effective_node_status(n, active_poll=active_poll) != "online":
+                continue
+            if not n.active_promoter_user_id:
+                continue
+            key = (n.provider or "vcat", n.active_promoter_user_id, n.active_promoter_sub_id or "")
+            existing = promoter_by_key.get(key)
+            if existing and existing.status == "active":
+                continue
+            matched_known = next(
+                (
+                    item
+                    for item in (n.detected_promoter_accounts_json or [])
+                    if isinstance(item, dict)
+                    and str(item.get("external_user_id") or "") == n.active_promoter_user_id
+                    and str(item.get("external_sub_id") or "") == (n.active_promoter_sub_id or "")
+                ),
+                {},
+            )
+            pending.append(
+                {
+                    "node_id": n.id,
+                    "node_name": n.name,
+                    "node_scope": n.node_scope,
+                    "provider": n.provider or "vcat",
+                    "external_user_id": n.active_promoter_user_id,
+                    "external_sub_id": n.active_promoter_sub_id,
+                    "nickname": matched_known.get("nickname") or n.active_promoter_label or f"渠道推广器 #{n.active_promoter_user_id}",
+                    "username": matched_known.get("username"),
+                    "masked_mobile": matched_known.get("masked_mobile"),
+                    "display_label": matched_known.get("display_label")
+                    or n.active_promoter_label
+                    or f"渠道推广器 #{n.active_promoter_user_id}",
+                    "default_owner_scope": "personal" if n.node_scope == "client_local" else "team_shared",
+                }
+            )
+        return pending
 
     def list_nodes(self, actor: User) -> dict[str, Any]:
         relay_bus = getattr(self.app.state, "relay_bus", None)
         with self.Session() as db:
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
             direct_node = self.router.ensure_direct_node(db)
+            self._refresh_direct_node_identity(db, direct_node)
             settings = self._settings(db)
             ex = settings.get("executor", {})
             default_node_id = (ex.get("default_node_id") or "").strip()
@@ -524,6 +787,7 @@ class VcatOperationsService:
             pending_cmds = list(
                 db.scalars(select(AgentCommand).where(AgentCommand.status.in_(("queued", "leased"))))
             )
+            promoter_by_key = self._promoter_key_map(db)
             db.commit()
 
         queued_map: dict[str, int] = {}
@@ -536,12 +800,13 @@ class VcatOperationsService:
 
         visible_nodes = []
         for n in rows:
-            if (
-                actor.role == "admin"
-                or n.node_scope in ("server_relay", "server_direct")
-                or (n.node_scope == "client_local" and n.owner_user_id == actor.id)
-            ):
+            if self._can_access_node(actor, n):
                 active_poll = bool(relay_bus and relay_bus.is_long_polling(n.id))
+                matched_promoter = (
+                    promoter_by_key.get((n.provider or "vcat", n.active_promoter_user_id, n.active_promoter_sub_id or ""))
+                    if n.active_promoter_user_id
+                    else None
+                )
                 visible_nodes.append(
                     _node_dict(
                         n,
@@ -549,8 +814,10 @@ class VcatOperationsService:
                         active_poll=active_poll,
                         queued_commands=queued_map.get(n.id, 0),
                         running_commands=running_map.get(n.id, 0),
+                        matched_promoter=matched_promoter,
                     )
                 )
+        pending_activations = self._pending_promoter_activations(actor, rows, promoter_by_key, relay_bus=relay_bus)
         return {
             "mode": ex.get("mode", "manual"),
             "default_node_id": default_node_id,
@@ -560,6 +827,7 @@ class VcatOperationsService:
             "catchup_minutes": int(ex.get("catchup_minutes", 30)),
             "preflight_minutes": int(ex.get("preflight_minutes", 30)),
             "nodes": visible_nodes,
+            "pending_promoter_activations": pending_activations,
         }
 
     def create_pair_code(self, actor: User, node_scope: str, label: str = "") -> dict[str, Any]:
@@ -570,7 +838,7 @@ class VcatOperationsService:
             if node_scope == "server_relay" and actor.role != "admin":
                 raise HTTPException(403, "仅管理员可创建服务器执行机配对码")
             if node_scope == "client_local" and not ex.get("allow_client_local", True) and actor.role != "admin":
-                raise HTTPException(403, "管理员未启用前端本机小V猫模式")
+                raise HTTPException(403, "管理员未启用前端本机渠道推广器模式")
 
             raw_code = "vcat_pair_" + secrets.token_urlsafe(18)
             expires = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
@@ -755,7 +1023,7 @@ class VcatOperationsService:
             if node.transport_mode == "direct_http":
                 token = self.app.state.secrets.decrypt(node.token_encrypted or "")
                 if not token:
-                    raise HTTPException(422, "节点未配置 MCP 访问令牌")
+                    raise HTTPException(422, "节点未配置渠道推广器访问令牌")
                 client = StreamableHttpMcpClient(node.mcp_url or "http://127.0.0.1:3199/mcp", token)
                 try:
                     tools = client.list_tools(timeout_sec=10)
@@ -766,13 +1034,14 @@ class VcatOperationsService:
                         n.status = "mcp_error"
                         n.updated_at = now()
                     db.commit()
-                    raise HTTPException(502, f"探测小V猫 MCP 失败: {exc}") from None
+                    raise HTTPException(502, f"探测渠道推广器服务失败: {exc}") from None
                 db.connection().exec_driver_sql("BEGIN IMMEDIATE")
                 n = db.get(ExecutorNode, node.id)
                 n.status = "online"
                 n.last_heartbeat_at = now()
                 n.vcat_version = "3.1.0"
                 n.capabilities_json = {"tool_count": len(tools), "tool_names": [t.get("name") for t in tools[:30]]}
+                self._refresh_direct_node_identity(db, n)
                 db.commit()
                 return {"node": _node_dict(n), "tool_count": len(tools)}
 
@@ -881,107 +1150,960 @@ class VcatOperationsService:
             db.commit()
             return {"ok": True, "deleted_node_id": node_id}
 
-    # ---------- Accounts & Binding ----------
+    # ---------- Accounts, Promoters & Binding ----------
 
-    def _can_access_account(self, db, actor: User, acc: PlatformAccount, node: ExecutorNode | None) -> bool:
+    def _can_access_account(
+        self,
+        db,
+        actor: User,
+        acc: PlatformAccount,
+        node: ExecutorNode | None,
+        promoter: PromoterAccount | None = None,
+    ) -> bool:
         if actor.role == "admin":
             return True
         if acc.ip_id:
             return can_ip(db, actor, acc.ip_id)
         if node and node.node_scope == "client_local" and node.owner_user_id == actor.id:
             return True
+        if promoter and promoter.owner_scope == "personal" and promoter.owner_user_id == actor.id:
+            return True
         if acc.bound_by == actor.id:
             return True
+        if actor.role == "leader" and not acc.ip_id:
+            if promoter and promoter.owner_scope == "team_shared":
+                return True
+            if not promoter and node and node.node_scope in ("server_direct", "server_relay"):
+                return True
         return False
 
-    def list_accounts(self, actor: User, ip_id: str = "", include_removed: bool = False) -> list[dict[str, Any]]:
+    def _fetch_all_remote_accounts(self, actor: User, node_id: str | None = None) -> tuple[ExecutorNode, list[dict[str, Any]], bool]:
+        items: list[dict[str, Any]] = []
+        seen_uids: set[str] = set()
+        resolved_node: ExecutorNode | None = None
+        is_complete = True
+        page = 1
+        page_size = 100
+        while page <= 50:
+            node, res = self._execute_mcp(
+                actor=actor,
+                node_id=node_id,
+                account_id=None,
+                action_type="sync_accounts",
+                tool_name="vcat_list_accounts",
+                arguments={"page": page, "pageSize": page_size},
+                requires_rate_limit=False,
+            )
+            resolved_node = node
+            if not res.ok:
+                raise HTTPException(502, res.error_message or "同步账号失败")
+            payload = res.payload if isinstance(res.payload, dict) else {}
+            batch = payload.get("list") or payload.get("accounts") or []
+            if not isinstance(batch, list):
+                batch = []
+            for raw in batch:
+                if not isinstance(raw, dict) or not raw.get("uid"):
+                    continue
+                v_uid = str(raw["uid"])
+                if v_uid in seen_uids:
+                    continue
+                seen_uids.add(v_uid)
+                items.append(raw)
+            total_remote = payload.get("total")
+            if len(batch) < page_size:
+                is_complete = total_remote is None or len(items) >= int(total_remote)
+                break
+            if total_remote is not None and len(items) >= int(total_remote):
+                is_complete = True
+                break
+            if page == 50:
+                is_complete = False
+                break
+            page += 1
+        assert resolved_node is not None
+        return resolved_node, items, is_complete
+
+    def _upsert_platform_accounts(
+        self,
+        db,
+        *,
+        node: ExecutorNode,
+        promoter: PromoterAccount | None,
+        actor: User,
+        items: list[dict[str, Any]],
+        default_source: str = "promoter_import",
+        mark_missing: bool = True,
+    ) -> tuple[int, int]:
+        returned_uids: set[str] = set()
+        synced = 0
+        for raw in items:
+            if not isinstance(raw, dict) or not raw.get("uid"):
+                continue
+            v_uid = str(raw["uid"])
+            returned_uids.add(v_uid)
+            existing = None
+            if promoter is not None:
+                existing = db.scalar(
+                    select(PlatformAccount).where(
+                        PlatformAccount.promoter_account_id == promoter.id,
+                        PlatformAccount.vendor_uid == v_uid,
+                    )
+                )
+                if not existing:
+                    existing = db.scalar(
+                        select(PlatformAccount).where(
+                            PlatformAccount.node_id == node.id,
+                            PlatformAccount.vendor_uid == v_uid,
+                            PlatformAccount.promoter_account_id.is_(None),
+                        )
+                    )
+            else:
+                existing = db.scalar(
+                    select(PlatformAccount).where(
+                        PlatformAccount.node_id == node.id,
+                        PlatformAccount.vendor_uid == v_uid,
+                    )
+                )
+            plat_code = str(raw.get("platform") or "")
+            plat_name = str(raw.get("platformName") or PLATFORM_CN_MAP.get(plat_code, plat_code))
+            raw_tags = raw.get("tags") if isinstance(raw.get("tags"), list) else []
+            tags_clean = [str(t.get("name") if isinstance(t, dict) else t).strip() for t in raw_tags if str(t.get("name") if isinstance(t, dict) else t).strip()]
+            group_name = str(raw.get("groupName") or "").strip() or None
+            remark = str(raw.get("remark") or "").strip()
+            fans_total = clean_metric_number(raw.get("fansTotal"))
+            if existing:
+                existing.node_id = node.id
+                if promoter is not None and not existing.promoter_account_id:
+                    existing.promoter_account_id = promoter.id
+                if not existing.source:
+                    existing.source = default_source
+                existing.platform = plat_code or existing.platform
+                existing.platform_name = plat_name or existing.platform_name
+                existing.nickname = str(raw.get("nickname") or existing.nickname)
+                existing.avatar = raw.get("avatar") or existing.avatar
+                if group_name is not None:
+                    existing.group_name = group_name
+                if tags_clean or raw.get("tags") is not None:
+                    existing.tags_json = tags_clean
+                if remark or raw.get("remark") is not None:
+                    existing.remark = remark
+                if fans_total is not None:
+                    existing.fans_total = fans_total
+                existing.login_status = str(raw.get("loginStatus") or existing.login_status)
+                existing.active = True
+                existing.removed_at = None
+                existing.updated_at = now()
+            else:
+                db.add(
+                    PlatformAccount(
+                        id=uid(),
+                        node_id=node.id,
+                        promoter_account_id=promoter.id if promoter is not None else None,
+                        vendor_uid=v_uid,
+                        platform=plat_code,
+                        platform_name=plat_name,
+                        nickname=str(raw.get("nickname") or v_uid),
+                        avatar=raw.get("avatar"),
+                        source=default_source,
+                        group_name=group_name,
+                        tags_json=tags_clean,
+                        remark=remark,
+                        fans_total=fans_total,
+                        login_status=str(raw.get("loginStatus") or "未知"),
+                        bound_by=actor.id if node.node_scope == "client_local" else None,
+                    )
+                )
+            synced += 1
+
+        removed_count = 0
+        if mark_missing:
+            stale_stmt = select(PlatformAccount).where(PlatformAccount.active.is_(True))
+            if promoter is not None:
+                stale_stmt = stale_stmt.where(PlatformAccount.promoter_account_id == promoter.id)
+            else:
+                stale_stmt = stale_stmt.where(
+                    PlatformAccount.node_id == node.id,
+                    PlatformAccount.promoter_account_id.is_(None),
+                )
+            for stale in db.scalars(stale_stmt):
+                if stale.vendor_uid not in returned_uids:
+                    stale.active = False
+                    stale.removed_at = now()
+                    stale.login_status = "已在渠道推广器移除"
+                    stale.ip_id = None
+                    stale.team_id = None
+                    stale.updated_at = now()
+                    removed_count += 1
+        return synced, removed_count
+
+    def _upsert_post_snapshot(
+        self,
+        db,
+        *,
+        p: dict[str, Any],
+        default_platform: str,
+        account_id: str | None,
+        ip_id: str | None,
+        vendor_uid: str,
+        today: str,
+    ) -> PublishedPost | None:
+        if not isinstance(p, dict) or not p.get("postId"):
+            return None
+        plat = str(p.get("platform") or default_platform or "")
+        pid = str(p["postId"])
+        row = db.scalar(
+            select(PublishedPost).where(
+                PublishedPost.platform == plat,
+                PublishedPost.vendor_uid == vendor_uid,
+                PublishedPost.vendor_post_id == pid,
+            )
+        )
+        if not row:
+            row = PublishedPost(
+                id=uid(),
+                platform=plat,
+                account_id=account_id,
+                ip_id=ip_id,
+                vendor_uid=vendor_uid,
+                vendor_post_id=pid,
+            )
+            db.add(row)
+            db.flush()
+        else:
+            if account_id and not row.account_id:
+                row.account_id = account_id
+            if ip_id and not row.ip_id:
+                row.ip_id = ip_id
+        row.title = str(p.get("title") or "")
+        row.desc = p.get("desc")
+        row.cover_url = p.get("cover")
+        row.url = p.get("url")
+        row.publish_status = str(p.get("publishStatus") or "published")
+        row.post_time_utc = str(p.get("postTime") or "")
+        row.last_synced_at = now()
+
+        snap = db.scalar(
+            select(MetricSnapshot).where(
+                MetricSnapshot.subject_type == "post",
+                MetricSnapshot.subject_id == row.id,
+                MetricSnapshot.observed_date == today,
+                MetricSnapshot.metric_type == "cumulative",
+            )
+        )
+        mvals = {
+            "views": clean_metric_number(p.get("view")),
+            "likes": clean_metric_number(p.get("like")),
+            "comments": clean_metric_number(p.get("comment")),
+            "forwards": clean_metric_number(p.get("forward")),
+            "favorites": clean_metric_number(p.get("favorite") if p.get("favorite") is not None else p.get("love")),
+            "fans_add": clean_metric_number(p.get("fansAdd")),
+            "full_view_rate": clean_metric_number(p.get("fullView"), as_float=True),
+            "avg_view_sec": clean_metric_number(p.get("viewTime"), as_float=True),
+        }
+        if snap:
+            for k, v in mvals.items():
+                setattr(snap, k, v)
+            snap.updated_at = now()
+        else:
+            db.add(
+                MetricSnapshot(
+                    id=uid(),
+                    subject_type="post",
+                    subject_id=row.id,
+                    ip_id=ip_id,
+                    observed_date=today,
+                    metric_type="cumulative",
+                    **mvals,
+                )
+            )
+        return row
+
+    def _upsert_account_stats_snapshot(
+        self,
+        db,
+        *,
+        account_id: str,
+        ip_id: str | None,
+        today: str,
+        total: dict[str, Any] | None = None,
+        daily: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if total:
+            snap = db.scalar(
+                select(MetricSnapshot).where(
+                    MetricSnapshot.subject_type == "account",
+                    MetricSnapshot.subject_id == account_id,
+                    MetricSnapshot.observed_date == today,
+                    MetricSnapshot.metric_type == "cumulative",
+                )
+            )
+            vals = {
+                "fans_total": clean_metric_number(total.get("fans")),
+                "likes": clean_metric_number(total.get("like")),
+                "favorites": clean_metric_number(total.get("favorite")),
+            }
+            if snap:
+                for k, v in vals.items():
+                    if v is not None:
+                        setattr(snap, k, v)
+                snap.updated_at = now()
+            else:
+                db.add(
+                    MetricSnapshot(
+                        id=uid(),
+                        subject_type="account",
+                        subject_id=account_id,
+                        ip_id=ip_id,
+                        observed_date=today,
+                        metric_type="cumulative",
+                        **vals,
+                    )
+                )
+        for d in daily or []:
+            if not isinstance(d, dict) or not d.get("date"):
+                continue
+            obs = str(d["date"])[:10]
+            dsnap = db.scalar(
+                select(MetricSnapshot).where(
+                    MetricSnapshot.subject_type == "account",
+                    MetricSnapshot.subject_id == account_id,
+                    MetricSnapshot.observed_date == obs,
+                    MetricSnapshot.metric_type == "daily_delta",
+                )
+            )
+            dvals = {
+                "views": clean_metric_number(d.get("view")),
+                "likes": clean_metric_number(d.get("like")),
+                "comments": clean_metric_number(d.get("comment")),
+                "forwards": clean_metric_number(d.get("forward")),
+                "favorites": clean_metric_number(d.get("favorite")),
+                "fans_total": clean_metric_number(d.get("fansTotal")),
+                "fans_add": clean_metric_number(d.get("fansAdd")),
+            }
+            if dsnap:
+                for k, v in dvals.items():
+                    setattr(dsnap, k, v)
+                dsnap.updated_at = now()
+            else:
+                db.add(
+                    MetricSnapshot(
+                        id=uid(),
+                        subject_type="account",
+                        subject_id=account_id,
+                        ip_id=ip_id,
+                        observed_date=obs,
+                        metric_type="daily_delta",
+                        **dvals,
+                    )
+                )
+
+    def list_promoter_accounts(self, actor: User) -> dict[str, Any]:
+        relay_bus = getattr(self.app.state, "relay_bus", None)
+        with self.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            direct_node = self.router.ensure_direct_node(db)
+            self._refresh_direct_node_identity(db, direct_node)
+            nodes = list(db.scalars(select(ExecutorNode)))
+            nodes_map = {n.id: n for n in nodes}
+            promoters = list(db.scalars(select(PromoterAccount).order_by(PromoterAccount.updated_at.desc())))
+            acc_counts: dict[str, int] = {}
+            for a in db.scalars(select(PlatformAccount).where(PlatformAccount.active.is_(True))):
+                if a.promoter_account_id:
+                    acc_counts[a.promoter_account_id] = acc_counts.get(a.promoter_account_id, 0) + 1
+            promoter_by_key = self._promoter_key_map(db)
+            db.commit()
+
+        items = []
+        for pa in promoters:
+            n = nodes_map.get(pa.node_id)
+            if self._can_access_promoter(actor, pa, n):
+                active_poll = bool(relay_bus and n and relay_bus.is_long_polling(n.id))
+                items.append(_promoter_dict(pa, n, account_count=acc_counts.get(pa.id, 0), active_poll=active_poll))
+        pending = self._pending_promoter_activations(actor, nodes, promoter_by_key, relay_bus=relay_bus)
+        return {"items": items, "pending_activations": pending}
+
+    def preview_promoter_import(self, actor: User, node_id: str) -> dict[str, Any]:
+        with self.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                node = self.router.resolve_node(db, node_id=node_id, actor=actor)
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from None
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            if node.transport_mode == "direct_http":
+                self._refresh_direct_node_identity(db, node)
+            if actor.role == "member" and node.node_scope != "client_local":
+                raise HTTPException(403, "仅管理员或团队长可预览共享节点导入")
+            existing = (
+                find_promoter_account(
+                    db,
+                    provider=node.provider or "vcat",
+                    external_user_id=node.active_promoter_user_id,
+                    external_sub_id=node.active_promoter_sub_id,
+                )
+                if node.active_promoter_user_id
+                else None
+            )
+            matched_known = next(
+                (
+                    item
+                    for item in (node.detected_promoter_accounts_json or [])
+                    if isinstance(item, dict)
+                    and str(item.get("external_user_id") or "") == (node.active_promoter_user_id or "")
+                    and str(item.get("external_sub_id") or "") == (node.active_promoter_sub_id or "")
+                ),
+                {},
+            )
+            node_snapshot = {
+                "node_id": node.id,
+                "node_name": node.name,
+                "node_scope": node.node_scope,
+                "provider": node.provider or "vcat",
+                "detected": bool(node.active_promoter_user_id),
+                "external_user_id": node.active_promoter_user_id,
+                "external_sub_id": node.active_promoter_sub_id,
+                "nickname": matched_known.get("nickname") or node.active_promoter_label or "",
+                "username": matched_known.get("username"),
+                "masked_mobile": matched_known.get("masked_mobile"),
+                "display_label": matched_known.get("display_label") or node.active_promoter_label or "",
+                "already_activated": bool(existing and existing.status == "active"),
+                "existing_promoter_id": existing.id if existing else None,
+            }
+            db.commit()
+
+        _, remote_accounts, _ = self._fetch_all_remote_accounts(actor, node_id=node_id)
+        by_platform: dict[str, int] = {}
+        for raw in remote_accounts:
+            pname = str(raw.get("platformName") or PLATFORM_CN_MAP.get(str(raw.get("platform") or ""), raw.get("platform") or "未知"))
+            by_platform[pname] = by_platform.get(pname, 0) + 1
+
+        post_count: int | None = None
+        verify_count: int | None = None
+        try:
+            _, post_res = self._execute_mcp(
+                actor=actor,
+                node_id=node_id,
+                account_id=None,
+                action_type="preview_posts",
+                tool_name="vcat_list_posts",
+                arguments={"page": 1, "pageSize": 1},
+                requires_rate_limit=False,
+            )
+            if post_res.ok and isinstance(post_res.payload, dict):
+                if post_res.payload.get("total") is not None:
+                    post_count = int(post_res.payload["total"])
+                else:
+                    post_count = len(post_res.payload.get("list") or [])
+        except Exception:
+            post_count = None
+
+        try:
+            _, verify_res = self._execute_mcp(
+                actor=actor,
+                node_id=node_id,
+                account_id=None,
+                action_type="preview_verify_results",
+                tool_name="vcat_list_verify_results",
+                arguments={"page": 1, "pageSize": 100},
+                requires_rate_limit=False,
+            )
+            if verify_res.ok and isinstance(verify_res.payload, dict):
+                if verify_res.payload.get("total") is not None:
+                    verify_count = int(verify_res.payload["total"])
+                else:
+                    verify_count = len(verify_res.payload.get("list") or [])
+        except Exception:
+            verify_count = None
+
+        return {
+            **node_snapshot,
+            "account_count": len(remote_accounts),
+            "platform_breakdown": by_platform,
+            "post_count": post_count,
+            "verify_count": verify_count,
+            "sample_accounts": [
+                {
+                    "uid": str(r.get("uid") or ""),
+                    "nickname": str(r.get("nickname") or r.get("uid") or ""),
+                    "platform_name": str(r.get("platformName") or PLATFORM_CN_MAP.get(str(r.get("platform") or ""), r.get("platform") or "")),
+                    "login_status": str(r.get("loginStatus") or "未知"),
+                }
+                for r in remote_accounts[:20]
+            ],
+        }
+
+    def activate_promoter_account(
+        self,
+        actor: User,
+        *,
+        node_id: str,
+        remark: str = "",
+        masked_mobile: str | None = None,
+        owner_scope: str | None = None,
+        manual_name: str = "",
+        import_posts: bool = True,
+        import_verify: bool = True,
+        import_stats: bool = True,
+    ) -> dict[str, Any]:
+        with self.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                node = self.router.resolve_node(db, node_id=node_id, actor=actor)
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from None
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            if node.transport_mode == "direct_http":
+                self._refresh_direct_node_identity(db, node)
+            if actor.role == "member" and node.node_scope != "client_local":
+                raise HTTPException(403, "仅管理员或团队长可激活共享节点渠道推广器")
+
+            default_scope = "personal" if node.node_scope == "client_local" else "team_shared"
+            resolved_scope = owner_scope or default_scope
+            if resolved_scope not in ("team_shared", "personal"):
+                raise HTTPException(422, "归属范围仅支持 team_shared 或 personal")
+            if actor.role == "member":
+                resolved_scope = "personal"
+
+            clean_remark = (remark or "").strip()
+            clean_manual = (manual_name or "").strip()
+            clean_mobile = mask_mobile_text(masked_mobile)
+            if (masked_mobile or "").strip() and not clean_mobile:
+                raise HTTPException(422, "手机号标识格式不正确，请输入11位手机号或脱敏格式（如 138****5678）")
+
+            ext_uid = node.active_promoter_user_id
+            ext_sub = node.active_promoter_sub_id
+            provider = node.provider or "vcat"
+            matched_known = next(
+                (
+                    item
+                    for item in (node.detected_promoter_accounts_json or [])
+                    if isinstance(item, dict)
+                    and str(item.get("external_user_id") or "") == (ext_uid or "")
+                    and str(item.get("external_sub_id") or "") == (ext_sub or "")
+                ),
+                {},
+            )
+
+            promoter: PromoterAccount | None = None
+            if ext_uid:
+                promoter = find_promoter_account(db, provider=provider, external_user_id=ext_uid, external_sub_id=ext_sub)
+                if promoter:
+                    if promoter.node_id != node.id:
+                        promoter.node_id = node.id
+                        for existing_acc in db.scalars(select(PlatformAccount).where(PlatformAccount.promoter_account_id == promoter.id)):
+                            existing_acc.node_id = node.id
+                    promoter.status = "active"
+                    promoter.nickname = str(matched_known.get("nickname") or node.active_promoter_label or promoter.nickname or clean_manual)
+                    if matched_known.get("username") is not None:
+                        promoter.username = matched_known.get("username")
+                    if clean_mobile:
+                        promoter.masked_mobile = clean_mobile
+                    elif matched_known.get("masked_mobile") and not promoter.masked_mobile:
+                        promoter.masked_mobile = matched_known.get("masked_mobile")
+                    if clean_remark:
+                        promoter.remark = clean_remark
+                    promoter.owner_scope = resolved_scope
+                    promoter.owner_user_id = actor.id if resolved_scope == "personal" else None
+                    promoter.last_seen_at = now()
+                    promoter.updated_at = now()
+                else:
+                    promoter = PromoterAccount(
+                        id=uid(),
+                        provider=provider,
+                        external_user_id=ext_uid,
+                        external_sub_id=ext_sub,
+                        nickname=str(matched_known.get("nickname") or node.active_promoter_label or clean_manual or f"渠道推广器 #{ext_uid}"),
+                        username=matched_known.get("username"),
+                        masked_mobile=clean_mobile or matched_known.get("masked_mobile"),
+                        remark=clean_remark,
+                        node_id=node.id,
+                        owner_scope=resolved_scope,
+                        owner_user_id=actor.id if resolved_scope == "personal" else None,
+                        identity_source="local_probe",
+                        status="active",
+                        activated_by=actor.id,
+                        activated_at=now(),
+                        last_seen_at=now(),
+                    )
+                    db.add(promoter)
+                    db.flush()
+            else:
+                fallback_name = clean_manual or clean_remark or node.name
+                if not fallback_name:
+                    raise HTTPException(422, "未探测到本机渠道推广器标识，请填写识别名称后激活")
+                promoter = db.scalar(
+                    select(PromoterAccount).where(
+                        PromoterAccount.node_id == node.id,
+                        PromoterAccount.identity_source == "manual_fallback",
+                        PromoterAccount.status == "active",
+                    )
+                )
+                if promoter:
+                    promoter.nickname = fallback_name
+                    if clean_remark:
+                        promoter.remark = clean_remark
+                    if clean_mobile:
+                        promoter.masked_mobile = clean_mobile
+                    promoter.owner_scope = resolved_scope
+                    promoter.owner_user_id = actor.id if resolved_scope == "personal" else None
+                    promoter.last_seen_at = now()
+                    promoter.updated_at = now()
+                else:
+                    promoter = PromoterAccount(
+                        id=uid(),
+                        provider=provider,
+                        external_user_id=None,
+                        external_sub_id=None,
+                        nickname=fallback_name,
+                        username=None,
+                        masked_mobile=clean_mobile,
+                        remark=clean_remark,
+                        node_id=node.id,
+                        owner_scope=resolved_scope,
+                        owner_user_id=actor.id if resolved_scope == "personal" else None,
+                        identity_source="manual_fallback",
+                        status="active",
+                        activated_by=actor.id,
+                        activated_at=now(),
+                        last_seen_at=now(),
+                    )
+                    db.add(promoter)
+                    db.flush()
+            promoter_id = promoter.id
+            db.commit()
+
+        _, items, is_complete = self._fetch_all_remote_accounts(actor, node_id=node_id)
+        with self.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            node = db.get(ExecutorNode, node_id)
+            promoter = db.get(PromoterAccount, promoter_id)
+            synced_accounts, removed_accounts = self._upsert_platform_accounts(
+                db,
+                node=node,
+                promoter=promoter,
+                actor=actor,
+                items=items,
+                default_source="promoter_import",
+                mark_missing=is_complete,
+            )
+            promoter.last_synced_at = now()
+            promoter.updated_at = now()
+            imported_accs = list(
+                db.scalars(
+                    select(PlatformAccount).where(
+                        PlatformAccount.promoter_account_id == promoter.id,
+                        PlatformAccount.active.is_(True),
+                    )
+                )
+            )
+            uid_to_acc = {a.vendor_uid: (a.id, a.ip_id, a.platform) for a in imported_accs}
+            today = business_today()
+            stats_imported = 0
+            if import_stats:
+                for a in imported_accs:
+                    if a.fans_total is not None:
+                        self._upsert_account_stats_snapshot(
+                            db,
+                            account_id=a.id,
+                            ip_id=a.ip_id,
+                            today=today,
+                            total={"fans": a.fans_total},
+                        )
+                        stats_imported += 1
+            db.commit()
+
+        warnings: list[str] = []
+        posts_imported = 0
+        verify_imported = 0
+
+        if import_posts:
+            try:
+                all_posts: list[dict[str, Any]] = []
+                p_page = 1
+                while p_page <= 20:
+                    _, p_res = self._execute_mcp(
+                        actor=actor,
+                        node_id=node_id,
+                        account_id=None,
+                        action_type="import_posts",
+                        tool_name="vcat_list_posts",
+                        arguments={"page": p_page, "pageSize": 100},
+                        requires_rate_limit=False,
+                    )
+                    if not p_res.ok or not isinstance(p_res.payload, dict):
+                        if p_page == 1:
+                            warnings.append(f"历史作品缓存导入未完成：{p_res.error_message or '读取失败'}")
+                        break
+                    p_batch = p_res.payload.get("list") or []
+                    if not isinstance(p_batch, list) or not p_batch:
+                        break
+                    all_posts.extend(p_batch)
+                    total_posts = p_res.payload.get("total")
+                    if len(p_batch) < 100 or (total_posts is not None and len(all_posts) >= int(total_posts)):
+                        break
+                    p_page += 1
+                if all_posts:
+                    with self.Session() as db:
+                        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                        today = business_today()
+                        for post_item in all_posts:
+                            if not isinstance(post_item, dict):
+                                continue
+                            v_uid = str(post_item.get("uid") or post_item.get("accountUid") or "")
+                            acc_meta = uid_to_acc.get(v_uid)
+                            row = self._upsert_post_snapshot(
+                                db,
+                                p=post_item,
+                                default_platform=acc_meta[2] if acc_meta else str(post_item.get("platform") or ""),
+                                account_id=acc_meta[0] if acc_meta else None,
+                                ip_id=acc_meta[1] if acc_meta else None,
+                                vendor_uid=v_uid,
+                                today=today,
+                            )
+                            if row is not None:
+                                posts_imported += 1
+                        db.commit()
+            except Exception as exc:
+                warnings.append(f"历史作品缓存导入异常：{exc}")
+
+        if import_verify:
+            try:
+                _, v_res = self._execute_mcp(
+                    actor=actor,
+                    node_id=node_id,
+                    account_id=None,
+                    action_type="import_verify_results",
+                    tool_name="vcat_list_verify_results",
+                    arguments={"page": 1, "pageSize": 100},
+                    requires_rate_limit=False,
+                )
+                if v_res.ok and isinstance(v_res.payload, dict):
+                    v_items = v_res.payload.get("list") or []
+                    with self.Session() as db:
+                        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                        for vr in v_items:
+                            if not isinstance(vr, dict) or not vr.get("uid"):
+                                continue
+                            acc_meta = uid_to_acc.get(str(vr["uid"]))
+                            if not acc_meta:
+                                continue
+                            acc_row = db.get(PlatformAccount, acc_meta[0])
+                            if acc_row:
+                                acc_row.is_verified = bool(vr.get("verified", True))
+                                acc_row.last_verified_at = str(vr.get("verifyTime") or vr.get("updatedAt") or now())
+                                acc_row.verify_summary_json = vr
+                                acc_row.updated_at = now()
+                                verify_imported += 1
+                        db.commit()
+                else:
+                    warnings.append(f"视频号诊断结果导入未完成：{v_res.error_message or '读取失败'}")
+            except Exception as exc:
+                warnings.append(f"视频号诊断结果导入异常：{exc}")
+
+        if import_stats and 0 < len(imported_accs) <= 20:
+            for acc_row_id, acc_ip_id, _ in imported_accs:
+                v_uid = next((k for k, v in uid_to_acc.items() if v[0] == acc_row_id), None)
+                if not v_uid:
+                    continue
+                try:
+                    _, s_res = self._execute_mcp(
+                        actor=actor,
+                        node_id=node_id,
+                        account_id=None,
+                        action_type="import_account_stats",
+                        tool_name="vcat_get_account_stats",
+                        arguments={"uid": v_uid},
+                        requires_rate_limit=False,
+                    )
+                    if s_res.ok and isinstance(s_res.payload, dict):
+                        with self.Session() as db:
+                            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                            self._upsert_account_stats_snapshot(
+                                db,
+                                account_id=acc_row_id,
+                                ip_id=acc_ip_id,
+                                today=business_today(),
+                                total=s_res.payload.get("total") or {},
+                                daily=s_res.payload.get("daily") or [],
+                            )
+                            db.commit()
+                            stats_imported += 1
+                except Exception:
+                    continue
+
+        with self.Session() as db:
+            pa = db.get(PromoterAccount, promoter_id)
+            node = db.get(ExecutorNode, pa.node_id) if pa else None
+            cnt = db.query(PlatformAccount).filter(PlatformAccount.promoter_account_id == promoter_id, PlatformAccount.active.is_(True)).count()
+            promoter_view = _promoter_dict(pa, node, account_count=cnt)
+
+        return {
+            "promoter_account": promoter_view,
+            "import_summary": {
+                "accounts_imported": synced_accounts,
+                "accounts_removed": removed_accounts,
+                "posts_imported": posts_imported,
+                "verify_imported": verify_imported,
+                "stats_imported": stats_imported,
+                "warnings": warnings,
+            },
+        }
+
+    def update_promoter_account(
+        self,
+        actor: User,
+        promoter_account_id: str,
+        *,
+        remark: str | None = None,
+        masked_mobile: str | None = None,
+        owner_scope: str | None = None,
+        status: str | None = None,
+        fields_set: set[str] | None = None,
+    ) -> dict[str, Any]:
+        fields = fields_set or set()
+        with self.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            pa = db.get(PromoterAccount, promoter_account_id)
+            if not pa:
+                raise HTTPException(404, "渠道推广器账号不存在")
+            node = db.get(ExecutorNode, pa.node_id)
+            if not self._can_manage_promoter(actor, pa, node):
+                raise HTTPException(403, "仅管理员或账号所有者可修改该渠道推广器账号")
+            if "remark" in fields:
+                pa.remark = (remark or "").strip()
+            if "masked_mobile" in fields:
+                raw_m = (masked_mobile or "").strip()
+                if not raw_m:
+                    pa.masked_mobile = None
+                else:
+                    clean_m = mask_mobile_text(raw_m)
+                    if not clean_m:
+                        raise HTTPException(422, "手机号标识格式不正确，请输入11位手机号或脱敏格式（如 138****5678）")
+                    pa.masked_mobile = clean_m
+            if "owner_scope" in fields and owner_scope is not None:
+                if owner_scope not in ("team_shared", "personal"):
+                    raise HTTPException(422, "归属范围仅支持 team_shared 或 personal")
+                if actor.role != "admin" and owner_scope == "team_shared":
+                    raise HTTPException(403, "仅管理员可设为团队共享渠道推广器")
+                pa.owner_scope = owner_scope
+                pa.owner_user_id = actor.id if owner_scope == "personal" else None
+            if "status" in fields and status is not None:
+                if status not in ("active", "disabled"):
+                    raise HTTPException(422, "状态仅支持 active 或 disabled")
+                pa.status = status
+            pa.updated_at = now()
+            cnt = db.query(PlatformAccount).filter(PlatformAccount.promoter_account_id == pa.id, PlatformAccount.active.is_(True)).count()
+            db.commit()
+            return _promoter_dict(pa, node, account_count=cnt)
+
+    def sync_promoter_account(self, actor: User, promoter_account_id: str) -> dict[str, Any]:
+        relay_bus = getattr(self.app.state, "relay_bus", None)
+        with self.Session() as db:
+            pa = db.get(PromoterAccount, promoter_account_id)
+            if not pa:
+                raise HTTPException(404, "渠道推广器账号不存在")
+            node = db.get(ExecutorNode, pa.node_id)
+            if not self._can_access_promoter(actor, pa, node):
+                raise HTTPException(403, "无权同步该渠道推广器账号")
+            if node and node.transport_mode == "direct_http":
+                db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                self._refresh_direct_node_identity(db, node)
+                db.commit()
+                pa = db.get(PromoterAccount, promoter_account_id)
+                node = db.get(ExecutorNode, pa.node_id)
+            active_poll = bool(relay_bus and node and relay_bus.is_long_polling(node.id))
+            rt, reason = _promoter_runtime_status(pa, node, active_poll=active_poll)
+            if rt == "switched_away":
+                raise HTTPException(409, reason)
+            target_node_id = pa.node_id
+
+        node, items, is_complete = self._fetch_all_remote_accounts(actor, node_id=target_node_id)
+        with self.Session() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            pa = db.get(PromoterAccount, promoter_account_id)
+            node = db.get(ExecutorNode, pa.node_id)
+            synced, removed_count = self._upsert_platform_accounts(
+                db,
+                node=node,
+                promoter=pa,
+                actor=actor,
+                items=items,
+                default_source="promoter_import",
+                mark_missing=is_complete,
+            )
+            pa.last_synced_at = now()
+            pa.updated_at = now()
+            db.commit()
+        return {"synced": synced, "removed_count": removed_count, "accounts": self.list_accounts(actor, promoter_account_id=promoter_account_id)}
+
+    def list_accounts(
+        self,
+        actor: User,
+        ip_id: str = "",
+        include_removed: bool = False,
+        promoter_account_id: str = "",
+        availability_status: str = "",
+        unbound_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        relay_bus = getattr(self.app.state, "relay_bus", None)
         with self.Session() as db:
             if ip_id:
                 require_ip(db, actor, ip_id)
             nodes = {n.id: n for n in db.scalars(select(ExecutorNode))}
+            promoters = {p.id: p for p in db.scalars(select(PromoterAccount))}
             stmt = select(PlatformAccount)
             if not include_removed:
                 stmt = stmt.where(PlatformAccount.active.is_(True))
+            if promoter_account_id:
+                stmt = stmt.where(PlatformAccount.promoter_account_id == promoter_account_id)
+            if unbound_only:
+                stmt = stmt.where(PlatformAccount.ip_id.is_(None))
             rows = list(db.scalars(stmt.order_by(PlatformAccount.updated_at.desc())))
             result = []
             for a in rows:
                 if ip_id and a.ip_id != ip_id:
                     continue
-                if self._can_access_account(db, actor, a, nodes.get(a.node_id)):
-                    result.append(_account_dict(a, nodes.get(a.node_id)))
+                node = nodes.get(a.node_id)
+                promoter = promoters.get(a.promoter_account_id) if a.promoter_account_id else None
+                if self._can_access_account(db, actor, a, node, promoter):
+                    active_poll = bool(relay_bus and node and relay_bus.is_long_polling(node.id))
+                    item = _account_dict(a, node, promoter, active_poll=active_poll)
+                    if availability_status and item["availability_status"] != availability_status:
+                        continue
+                    result.append(item)
             return result
 
-    def sync_accounts(self, actor: User, node_id: str | None = None) -> dict[str, Any]:
-        node, res = self._execute_mcp(
-            actor=actor,
-            node_id=node_id,
-            account_id=None,
-            action_type="sync_accounts",
-            tool_name="vcat_list_accounts",
-            arguments={"page": 1, "pageSize": 100},
-            requires_rate_limit=False,
-        )
-        if not res.ok:
-            raise HTTPException(502, res.error_message or "同步账号失败")
-        items = []
-        if isinstance(res.payload, dict):
-            items = res.payload.get("list") or res.payload.get("accounts") or []
-        returned_uids: set[str] = set()
+    def sync_accounts(self, actor: User, node_id: str | None = None, *, default_source: str = "promoter_import") -> dict[str, Any]:
+        node, items, is_complete = self._fetch_all_remote_accounts(actor, node_id=node_id)
         with self.Session() as db:
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
-            synced = 0
-            for raw in items:
-                if not isinstance(raw, dict) or not raw.get("uid"):
-                    continue
-                v_uid = str(raw["uid"])
-                returned_uids.add(v_uid)
-                existing = db.scalar(
-                    select(PlatformAccount).where(
-                        PlatformAccount.node_id == node.id, PlatformAccount.vendor_uid == v_uid
-                    )
+            node_row = db.get(ExecutorNode, node.id)
+            if node_row.transport_mode == "direct_http":
+                self._refresh_direct_node_identity(db, node_row)
+            promoter = (
+                find_promoter_account(
+                    db,
+                    provider=node_row.provider or "vcat",
+                    external_user_id=node_row.active_promoter_user_id,
+                    external_sub_id=node_row.active_promoter_sub_id,
                 )
-                plat_code = str(raw.get("platform") or "")
-                plat_name = str(raw.get("platformName") or PLATFORM_CN_MAP.get(plat_code, plat_code))
-                if existing:
-                    existing.platform = plat_code or existing.platform
-                    existing.platform_name = plat_name or existing.platform_name
-                    existing.nickname = str(raw.get("nickname") or existing.nickname)
-                    existing.avatar = raw.get("avatar") or existing.avatar
-                    existing.login_status = str(raw.get("loginStatus") or existing.login_status)
-                    existing.active = True
-                    existing.removed_at = None
-                    existing.updated_at = now()
-                else:
-                    db.add(
-                        PlatformAccount(
-                            id=uid(),
-                            node_id=node.id,
-                            vendor_uid=v_uid,
-                            platform=plat_code,
-                            platform_name=plat_name,
-                            nickname=str(raw.get("nickname") or v_uid),
-                            avatar=raw.get("avatar"),
-                            login_status=str(raw.get("loginStatus") or "未知"),
-                            bound_by=actor.id if node.node_scope == "client_local" else None,
-                        )
-                    )
-                synced += 1
-
-            removed_count = 0
-            total_remote = res.payload.get("total") if isinstance(res.payload, dict) else None
-            is_complete = isinstance(items, list) and len(items) < 100 and (total_remote is None or int(total_remote) <= len(items))
-            if is_complete:
-                for stale in db.scalars(
-                    select(PlatformAccount).where(PlatformAccount.node_id == node.id, PlatformAccount.active.is_(True))
-                ):
-                    if stale.vendor_uid not in returned_uids:
-                        stale.active = False
-                        stale.removed_at = now()
-                        stale.login_status = "已在小V猫移除"
-                        stale.ip_id = None
-                        stale.team_id = None
-                        stale.updated_at = now()
-                        removed_count += 1
+                if node_row.active_promoter_user_id
+                else None
+            )
+            synced, removed_count = self._upsert_platform_accounts(
+                db,
+                node=node_row,
+                promoter=promoter,
+                actor=actor,
+                items=items,
+                default_source=default_source,
+                mark_missing=is_complete,
+            )
+            if promoter:
+                promoter.last_synced_at = now()
+                promoter.updated_at = now()
             db.commit()
         return {"synced": synced, "removed_count": removed_count, "accounts": self.list_accounts(actor)}
 
@@ -992,6 +2114,7 @@ class VcatOperationsService:
             if not acc or not acc.active:
                 raise HTTPException(404, "平台账号不存在")
             node = db.get(ExecutorNode, acc.node_id)
+            promoter = db.get(PromoterAccount, acc.promoter_account_id) if acc.promoter_account_id else None
             if actor.role not in ("admin", "leader") and not (node and node.node_scope == "client_local" and node.owner_user_id == actor.id):
                 raise HTTPException(403, "仅管理员、团队长或本机节点所有者可绑定账号归属")
             require_ip(db, actor, ip_id)
@@ -1003,7 +2126,7 @@ class VcatOperationsService:
             acc.bound_by = actor.id
             acc.updated_at = now()
             db.commit()
-            return _account_dict(acc, node)
+            return _account_dict(acc, node, promoter)
 
     def unbind_account(self, actor: User, account_id: str) -> dict[str, Any]:
         with self.Session() as db:
@@ -1012,6 +2135,7 @@ class VcatOperationsService:
             if not acc or not acc.active:
                 raise HTTPException(404, "平台账号不存在")
             node = db.get(ExecutorNode, acc.node_id)
+            promoter = db.get(PromoterAccount, acc.promoter_account_id) if acc.promoter_account_id else None
             if actor.role not in ("admin", "leader") and not (node and node.node_scope == "client_local" and node.owner_user_id == actor.id):
                 raise HTTPException(403, "仅管理员、团队长或本机节点所有者可解绑账号归属")
             acc.ip_id = None
@@ -1029,7 +2153,7 @@ class VcatOperationsService:
                 duration_ms=0,
             )
             db.commit()
-            return _account_dict(acc, node)
+            return _account_dict(acc, node, promoter)
 
     def remove_account(
         self,
@@ -1041,7 +2165,7 @@ class VcatOperationsService:
         cancel_pending: bool = False,
     ) -> dict[str, Any]:
         if not confirm:
-            raise HTTPException(422, "从小V猫移除账号必须显式确认 confirm=true")
+            raise HTTPException(422, "从渠道推广器移除账号必须显式确认 confirm=true")
         with self.Session() as db:
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
             acc = db.get(PlatformAccount, account_id)
@@ -1049,9 +2173,9 @@ class VcatOperationsService:
                 raise HTTPException(404, "平台账号不存在")
             node = db.get(ExecutorNode, acc.node_id)
             if actor.role != "admin" and not (node and node.node_scope == "client_local" and node.owner_user_id == actor.id):
-                raise HTTPException(403, "仅管理员或本机节点所有者可从小V猫移除账号")
+                raise HTTPException(403, "仅管理员或本机节点所有者可从渠道推广器移除账号")
             if not acc.active:
-                raise HTTPException(409, "该账号已从小V猫移除")
+                raise HTTPException(409, "该账号已从渠道推广器移除")
             if (confirm_nickname or "").strip() != acc.nickname.strip():
                 raise HTTPException(422, "确认昵称与账号昵称不一致，已阻止移除")
 
@@ -1067,7 +2191,7 @@ class VcatOperationsService:
                 for a in pending:
                     a.state = "CANCELLED"
                     a.error_class = "ACCOUNT_REMOVED"
-                    a.error_message = "从小V猫移除账号时联动取消待发任务"
+                    a.error_message = "从渠道推广器移除账号时联动取消待发任务"
                     a.updated_at = now()
                     t = db.get(PublishTarget, a.target_id)
                     if t:
@@ -1086,20 +2210,21 @@ class VcatOperationsService:
             requires_rate_limit=True,
         )
         if not res.ok:
-            raise HTTPException(502, res.error_message or "从小V猫移除账号失败")
+            raise HTTPException(502, res.error_message or "从渠道推广器移除账号失败")
 
         with self.Session() as db:
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
             acc = db.get(PlatformAccount, account_id)
             node = db.get(ExecutorNode, acc.node_id)
+            promoter = db.get(PromoterAccount, acc.promoter_account_id) if acc.promoter_account_id else None
             acc.active = False
             acc.removed_at = now()
-            acc.login_status = "已从小V猫移除"
+            acc.login_status = "已从渠道推广器移除"
             acc.ip_id = None
             acc.team_id = None
             acc.updated_at = now()
             db.commit()
-            return _account_dict(acc, node)
+            return _account_dict(acc, node, promoter)
 
     # ---------- Auth Challenges & Verification ----------
 
@@ -1126,7 +2251,7 @@ class VcatOperationsService:
     def create_login_link_challenge(self, actor: User, platform: str, node_id: str | None = None) -> dict[str, Any]:
         plat_code = PLATFORM_CODE_MAP.get(platform, platform)
         if plat_code == "GongZhongHao":
-            raise HTTPException(422, "公众号暂不支持小V猫上号链接，请在系统设置→微信生态配置公众号凭证")
+            raise HTTPException(422, "公众号暂不支持渠道推广器上号链接，请在系统设置→微信生态配置公众号凭证")
         node, create_res = self._execute_mcp(
             actor=actor,
             node_id=node_id,
@@ -1372,7 +2497,7 @@ class VcatOperationsService:
                     {"name": "content", "description": "正文内容（将推送至公众号草稿箱，状态标记为草稿态）"},
                 ],
                 "notes": [
-                    "实测小V猫 3.1.0 MCP 暂不支持公众号发布。",
+                    "当前渠道推广器服务暂不支持公众号发布。",
                     "首期仅推送到公众号草稿箱并标为 DRAFT_PUSHED，由人工在微信公众平台后台群发并回填公开链接。",
                 ],
             }
@@ -1605,7 +2730,7 @@ class VcatOperationsService:
             if node and node.node_scope == "client_local" and (node.status != "online" or not node.last_heartbeat_at or node.last_heartbeat_at < cutoff):
                 att.state = "WAITING_CLIENT_ONLINE"
                 att.error_class = "CLIENT_OFFLINE"
-                att.error_message = "操作者本机小V猫不在线，已挂起等待上线后一键继续"
+                att.error_message = "操作者本机渠道推广器不在线，已挂起等待上线后一键继续"
                 att.verification_status = "confirmed_failed"
                 att.verification_detail = att.error_message
                 target.status = "WAITING_CLIENT_ONLINE"
@@ -1694,14 +2819,14 @@ class VcatOperationsService:
                     att.state = "DRAFT_PUSHED"
                     att.vendor_draft_id = str(payload.get("draftId") or payload.get("id") or "")
                     att.verification_status = "verifying"
-                    att.verification_detail = "草稿已提交小V猫，正在回读草稿箱确认..."
+                    att.verification_detail = "草稿已提交渠道推广器，正在回读草稿箱确认..."
                     target.status = "DRAFT_PUSHED"
                     verify_kind = "draft"
                 else:
                     att.vendor_local_id = str(payload.get("localId") or payload.get("id") or payload.get("taskId") or "")
                     att.state = "PLATFORM_SCHEDULED" if target.schedule_owner == "platform" else "PUBLISHING"
                     att.verification_status = "verifying"
-                    att.verification_detail = "已提交小V猫，正在查询确认平台发布结果..."
+                    att.verification_detail = "已提交渠道推广器，正在查询确认平台发布结果..."
                     target.status = att.state
                     verify_kind = "publish"
             elif res.status == "NODE_OFFLINE":
@@ -1716,13 +2841,13 @@ class VcatOperationsService:
                 att.error_class = res.status
                 att.error_message = res.error_message or "提交响应超时，结果未知，请先核对任务列表，禁止直接重发"
                 att.verification_status = "verifying"
-                att.verification_detail = "提交超时，系统将自动核对小V猫任务列表确认结果"
+                att.verification_detail = "提交超时，系统将自动核对渠道推广器任务列表确认结果"
                 target.status = "UNKNOWN"
             else:
                 att.state = "REJECTED"
                 target.status = "REJECTED"
                 att.error_class = "DRAFT_REJECTED" if tool_name == "vcat_create_draft" else "PLATFORM_REJECTED"
-                att.error_message = res.error_message or "提交被平台或小V猫拒绝"
+                att.error_message = res.error_message or "提交被平台或渠道推广器拒绝"
                 att.verification_status = "confirmed_failed"
                 att.last_verified_at = now()
                 att.verification_detail = f"提交失败：{att.error_message}"
@@ -1799,7 +2924,7 @@ class VcatOperationsService:
         )
         if not res.ok:
             if raise_on_error:
-                raise HTTPException(502, res.error_message or "回读小V猫草稿箱失败")
+                raise HTTPException(502, res.error_message or "回读渠道推广器草稿箱失败")
             with self.Session() as db:
                 db.connection().exec_driver_sql("BEGIN IMMEDIATE")
                 att = db.get(PublishAttempt, attempt_id)
@@ -1867,14 +2992,14 @@ class VcatOperationsService:
                     att.verification_status = "confirmed_success"
                     att.error_class = None
                     att.error_message = None
-                    att.verification_detail = f"已回读确认草稿 #{draft_id_str} 已保存在小V猫草稿箱"
+                    att.verification_detail = f"已回读确认草稿 #{draft_id_str} 已保存在渠道推广器草稿箱"
             else:
                 att.state = "REJECTED"
                 target.status = "REJECTED"
                 att.remote_status = "draft_missing"
                 att.verification_status = "confirmed_failed"
                 att.error_class = "DRAFT_VERIFY_FAILED"
-                att.error_message = f"草稿 #{draft_id_str or '-'} 未在小V猫草稿箱中查到，可能推送失败，请检查内容或重试"
+                att.error_message = f"草稿 #{draft_id_str or '-'} 未在渠道推广器草稿箱中查到，可能推送失败，请检查内容或重试"
                 att.verification_detail = att.error_message
             att.updated_at = now()
             db.commit()
@@ -1918,7 +3043,7 @@ class VcatOperationsService:
         )
         if not res.ok or not isinstance(res.payload, dict):
             if raise_on_error:
-                raise HTTPException(502, res.error_message or "查询小V猫发布任务列表失败")
+                raise HTTPException(502, res.error_message or "查询渠道推广器发布任务列表失败")
             with self.Session() as db:
                 db.connection().exec_driver_sql("BEGIN IMMEDIATE")
                 att = db.get(PublishAttempt, attempt_id)
@@ -1948,7 +3073,7 @@ class VcatOperationsService:
                     att.verification_status = "verifying"
                 else:
                     att.verification_status = "unverified"
-                att.verification_detail = "暂未在小V猫发布任务列表中查到该任务，请稍后再次核对"
+                att.verification_detail = "暂未在渠道推广器发布任务列表中查到该任务，请稍后再次核对"
             att.updated_at = now()
             db.commit()
             return _attempt_dict(att, target, acc)
@@ -2051,7 +3176,7 @@ class VcatOperationsService:
             if not self._can_access_account(db, actor, acc, node):
                 raise HTTPException(403, "没有此账号的操作权限")
             if not acc.active:
-                raise HTTPException(409, "目标平台账号已从小V猫移除")
+                raise HTTPException(409, "目标平台账号已从渠道推广器移除")
             if src.state not in ("REJECTED", "RETRYABLE_FAILED", "WAITING_CLIENT_ONLINE", "MISSED", "CANCELLED"):
                 raise HTTPException(409, f"当前状态 {src.state} 不允许再次发布（结果未知请先核对状态）")
 
@@ -2321,9 +3446,9 @@ class VcatOperationsService:
             if not self._can_access_account(db, actor, acc, node):
                 raise HTTPException(403, "没有此账号的操作权限")
             if not acc.active:
-                raise HTTPException(409, "目标平台账号已从小V猫移除")
+                raise HTTPException(409, "目标平台账号已从渠道推广器移除")
             if target.platform == "GongZhongHao":
-                raise HTTPException(422, "公众号不支持经小V猫转正式群发，请在微信公众平台后台群发后登记公开链接")
+                raise HTTPException(422, "公众号不支持经渠道推广器转正式群发，请在微信公众平台后台群发后登记公开链接")
             if src.state != "DRAFT_PUSHED" or not src.vendor_draft_id:
                 raise HTTPException(409, "仅带有远端草稿 ID 的草稿态记录可转正式发布")
             existing_promo = db.scalar(select(PublishAttempt).where(PublishAttempt.idempotency_key == promo_key))
@@ -2417,7 +3542,7 @@ class VcatOperationsService:
                 promo.error_class = res.status
                 promo.error_message = res.error_message or "草稿转正式发布状态未知，请核对任务列表"
                 promo.verification_status = "verifying"
-                promo.verification_detail = "草稿转正式发布超时，系统将自动核对小V猫任务列表确认结果"
+                promo.verification_detail = "草稿转正式发布超时，系统将自动核对渠道推广器任务列表确认结果"
                 target.status = "UNKNOWN"
             else:
                 promo.state = "REJECTED"

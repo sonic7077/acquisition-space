@@ -124,6 +124,28 @@ class DedupeAccountsInput(BaseModel):
     node_id: str | None = None
 
 
+class PromoterPreviewInput(BaseModel):
+    node_id: str = Field(min_length=1)
+
+
+class PromoterActivateInput(BaseModel):
+    node_id: str = Field(min_length=1)
+    remark: str = Field(default="", max_length=120)
+    masked_mobile: str | None = Field(default=None, max_length=32)
+    owner_scope: str | None = None
+    manual_name: str = Field(default="", max_length=120)
+    import_posts: bool = True
+    import_verify: bool = True
+    import_stats: bool = True
+
+
+class PromoterUpdateInput(BaseModel):
+    remark: str | None = Field(default=None, max_length=120)
+    masked_mobile: str | None = Field(default=None, max_length=32)
+    owner_scope: str | None = None
+    status: str | None = None
+
+
 def register_operations(app, authenticated_user):
     if not hasattr(app.state, "relay_bus"):
         app.state.relay_bus = RelayEventBus()
@@ -205,13 +227,69 @@ def register_operations(app, authenticated_user):
     def start_local_agent(actor=Depends(actor_dep)):
         return service.try_local_agent_start(actor)
 
+    @app.get("/api/ops/promoter-accounts")
+    def list_promoter_accounts(actor=Depends(actor_dep)):
+        return service.list_promoter_accounts(actor)
+
+    @app.post("/api/ops/promoter-accounts/preview-import")
+    def preview_promoter_import(data: PromoterPreviewInput, actor=Depends(actor_dep)):
+        return service.preview_promoter_import(actor, data.node_id)
+
+    @app.post("/api/ops/promoter-accounts/activate")
+    def activate_promoter_account(data: PromoterActivateInput, actor=Depends(actor_dep)):
+        return service.activate_promoter_account(
+            actor,
+            node_id=data.node_id,
+            remark=data.remark,
+            masked_mobile=data.masked_mobile,
+            owner_scope=data.owner_scope,
+            manual_name=data.manual_name,
+            import_posts=data.import_posts,
+            import_verify=data.import_verify,
+            import_stats=data.import_stats,
+        )
+
+    @app.patch("/api/ops/promoter-accounts/{promoter_account_id}")
+    def update_promoter_account(promoter_account_id: str, data: PromoterUpdateInput, actor=Depends(actor_dep)):
+        return service.update_promoter_account(
+            actor,
+            promoter_account_id,
+            remark=data.remark,
+            masked_mobile=data.masked_mobile,
+            owner_scope=data.owner_scope,
+            status=data.status,
+            fields_set=data.model_fields_set,
+        )
+
+    @app.post("/api/ops/promoter-accounts/{promoter_account_id}/sync")
+    def sync_promoter_account(promoter_account_id: str, actor=Depends(actor_dep)):
+        return service.sync_promoter_account(actor, promoter_account_id)
+
     @app.get("/api/ops/accounts")
-    def list_accounts(ip_id: str = "", include_removed: bool = False, actor=Depends(actor_dep)):
-        return service.list_accounts(actor, ip_id=ip_id, include_removed=include_removed)
+    def list_accounts(
+        ip_id: str = "",
+        include_removed: bool = False,
+        promoter_account_id: str = "",
+        availability_status: str = "",
+        unbound_only: bool = False,
+        actor=Depends(actor_dep),
+    ):
+        return service.list_accounts(
+            actor,
+            ip_id=ip_id,
+            include_removed=include_removed,
+            promoter_account_id=promoter_account_id,
+            availability_status=availability_status,
+            unbound_only=unbound_only,
+        )
 
     @app.post("/api/ops/accounts/sync")
     def sync_accounts(data: dict | None = None, actor=Depends(actor_dep)):
-        return service.sync_accounts(actor, node_id=(data or {}).get("node_id"))
+        payload = data or {}
+        source = str(payload.get("source") or "promoter_import").strip() or "promoter_import"
+        if source not in ("promoter_import", "web_iframe"):
+            raise HTTPException(400, "source 仅支持 promoter_import / web_iframe")
+        return service.sync_accounts(actor, node_id=payload.get("node_id"), default_source=source)
 
     @app.get("/api/ops/accounts/duplicates")
     def list_duplicate_accounts(node_id: str | None = None, actor=Depends(actor_dep)):
