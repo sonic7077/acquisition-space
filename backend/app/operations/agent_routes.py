@@ -26,6 +26,7 @@ class AgentHeartbeatInput(BaseModel):
     mcp_ready: bool = True
     vcat_version: str = Field(default="3.1.0", max_length=40)
     capabilities: dict[str, Any] = Field(default_factory=dict)
+    node_name: str | None = Field(default=None, max_length=80)
 
 
 class AgentResultInput(BaseModel):
@@ -103,6 +104,7 @@ def register_agent_routes(app):
             db.commit()
             return {
                 "node_id": node.id,
+                "node_name": node.name,
                 "node_scope": node.node_scope,
                 "owner_user_id": node.owner_user_id,
                 "node_secret": raw_secret,
@@ -117,6 +119,10 @@ def register_agent_routes(app):
                 db.commit()
                 raise HTTPException(401, "执行节点凭据无效或已吊销")
             row.status = "online" if data.mcp_ready else "mcp_error"
+            if data.node_name is not None:
+                clean_name = data.node_name.strip()
+                if clean_name:
+                    row.name = clean_name
             row.vcat_version = data.vcat_version
             row.last_heartbeat_at = now()
             if data.capabilities:
@@ -125,7 +131,7 @@ def register_agent_routes(app):
                 row.capabilities_json = merged_caps
             row.updated_at = now()
             db.commit()
-            return {"ok": True, "node_id": row.id, "status": row.status}
+            return {"ok": True, "node_id": row.id, "node_name": row.name, "status": row.status}
 
     @app.post("/internal/agents/poll")
     def poll_command(wait: float = 0.0, node: ExecutorNode = Depends(agent_auth)):

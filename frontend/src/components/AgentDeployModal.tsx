@@ -27,9 +27,7 @@ export default function AgentDeployModal({ ctx, onClose, onDone }: Props) {
   const [config, setConfig] = useState<Row | null>(null);
   const [osKey, setOsKey] = useState<string>(() => detectBrowserOs());
   const [nodeScope, setNodeScope] = useState<string>(isAdmin ? "server_relay" : "client_local");
-  const [label, setLabel] = useState<string>(() =>
-    isAdmin ? "桌面托管Agent" : `${ctx.me?.name || "本机"}的Agent`,
-  );
+  const [label, setLabel] = useState<string>("niekun");
   const [downloadUrl, setDownloadUrl] = useState<string>("");
   const [urlDirty, setUrlDirty] = useState<boolean>(false);
   const [plan, setPlan] = useState<Row | null>(null);
@@ -102,7 +100,7 @@ export default function AgentDeployModal({ ctx, onClose, onDone }: Props) {
       const resp = await fetch("http://127.0.0.1:18899/health", { signal: ctrl.signal });
       const data = await resp.json();
       setHealthResult(
-        `本机 Agent 在线 · 节点=${data.node_id || "未知"} · 小V猫=${data.mcp_ready ? "就绪" : "未连接"}`,
+        `本机 Agent 在线 · 名称=${data.node_name || "未命名"} · 节点=${data.node_id || "未知"} · 小V猫=${data.mcp_ready ? "就绪" : "未连接"}`,
       );
     } catch {
       setHealthResult("未检测到运行中的本机 Agent（127.0.0.1:18899 无响应）");

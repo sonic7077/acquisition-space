@@ -1204,3 +1204,109 @@ def test_publish_verification_failure_feedback_and_republish_lifecycle(tmp_path)
         assert member.post("/api/ops/publish-tasks/a_unk_repub/republish").status_code == 409
     finally:
         mcp_srv.shutdown()
+
+
+def test_vcat_agent_node_name_bidirectional_sync_and_health(tmp_path):
+    from pathlib import Path
+    import urllib.request
+    from executor.vcat_agent import _start_local_health_server
+
+    mcp_srv, mcp_url, _ = start_mock_mcp_server()
+    try:
+        app, admin, _, _, _, _, _, _ = _setup_workspace(tmp_path)
+        pair = admin.post("/api/ops/nodes/pair-code", json={"node_scope": "server_relay", "label": "默认名"}).json()
+        state_dir = tmp_path / "named_agent"
+
+        runner = VcatAgentRunner(
+            server_url="http://testserver",
+            mcp_url=mcp_url,
+            mcp_token="mock-mcp-token-secret",
+            state_dir=state_dir,
+            mode="server_managed",
+            node_name="niekun",
+            min_interval_sec=0.0,
+            server_http_client=TestClient(app),
+        )
+        reg = runner.register(pair["pair_code"], "niekun")
+        node_id = reg["node_id"]
+        assert reg["node_name"] == "niekun"
+        creds = json.loads((Path(state_dir) / "node_credentials.json").read_text(encoding="utf-8"))
+        assert creds["node_name"] == "niekun"
+        assert creds["configured_node_name"] == "niekun"
+
+        hb1 = runner.heartbeat_once()
+        assert hb1["node_name"] == "niekun"
+
+        # 1. Local /health endpoint includes node_name
+        health_srv = _start_local_health_server(runner, "http://127.0.0.1:18787", port=0)
+        assert health_srv is not None
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{health_srv.server_port}/health", timeout=3) as resp:
+                health_payload = json.loads(resp.read().decode("utf-8"))
+            assert health_payload["node_id"] == node_id
+            assert health_payload["node_name"] == "niekun"
+        finally:
+            health_srv.shutdown()
+
+        # 2. Restart with updated configured node_name -> syncs new name to server
+        runner_cfg = VcatAgentRunner(
+            server_url="http://testserver",
+            mcp_url=mcp_url,
+            mcp_token="mock-mcp-token-secret",
+            state_dir=state_dir,
+            mode="server_managed",
+            node_name="mac-studio",
+            min_interval_sec=0.0,
+            server_http_client=TestClient(app),
+        )
+        hb2 = runner_cfg.heartbeat_once()
+        assert hb2["node_name"] == "mac-studio"
+        assert runner_cfg.node_name == "mac-studio"
+        nodes = admin.get("/api/ops/nodes").json()["nodes"]
+        assert next(n for n in nodes if n["id"] == node_id)["name"] == "mac-studio"
+
+        # 3. Rename via web API -> propagates back to runner and credentials on next heartbeat
+        rename_resp = admin.patch(f"/api/ops/nodes/{node_id}", json={"name": "web-renamed"})
+        assert rename_resp.status_code == 200
+        hb3 = runner_cfg.heartbeat_once()
+        assert hb3["node_name"] == "web-renamed"
+        assert runner_cfg.node_name == "web-renamed"
+        creds = json.loads((Path(state_dir) / "node_credentials.json").read_text(encoding="utf-8"))
+        assert creds["node_name"] == "web-renamed"
+        assert creds["configured_node_name"] == "mac-studio"
+
+        # 4. Launchd restart with unchanged env (explicit_node_name=False) must NOT overwrite web rename
+        runner_restart = VcatAgentRunner(
+            server_url="http://testserver",
+            mcp_url=mcp_url,
+            mcp_token="mock-mcp-token-secret",
+            state_dir=state_dir,
+            mode="server_managed",
+            node_name="mac-studio",
+            explicit_node_name=False,
+            min_interval_sec=0.0,
+            server_http_client=TestClient(app),
+        )
+        hb4 = runner_restart.heartbeat_once()
+        assert hb4["node_name"] == "web-renamed"
+        assert runner_restart.node_name == "web-renamed"
+
+        # 5. Explicit CLI --node-name forces server rename back to mac-studio
+        runner_cli = VcatAgentRunner(
+            server_url="http://testserver",
+            mcp_url=mcp_url,
+            mcp_token="mock-mcp-token-secret",
+            state_dir=state_dir,
+            mode="server_managed",
+            node_name="mac-studio",
+            explicit_node_name=True,
+            min_interval_sec=0.0,
+            server_http_client=TestClient(app),
+        )
+        hb5 = runner_cli.heartbeat_once()
+        assert hb5["node_name"] == "mac-studio"
+        assert runner_cli.node_name == "mac-studio"
+        nodes_after = admin.get("/api/ops/nodes").json()["nodes"]
+        assert next(n for n in nodes_after if n["id"] == node_id)["name"] == "mac-studio"
+    finally:
+        mcp_srv.shutdown()

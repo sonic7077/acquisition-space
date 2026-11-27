@@ -124,6 +124,8 @@ class VcatAgentRunner:
         mode: str = "client_local",
         node_secret: str = "",
         node_id: str = "",
+        node_name: str = "",
+        explicit_node_name: bool = False,
         min_interval_sec: float = 3.2,
         poll_wait: float | None = None,
         server_http_client: httpx.Client | None = None,
@@ -150,10 +152,43 @@ class VcatAgentRunner:
         self._mcp_client = mcp_http_client
         self.last_mcp_ready = False
 
-        if not self.node_secret and self.creds_path.is_file():
-            saved = json.loads(self.creds_path.read_text(encoding="utf-8"))
+        saved: dict[str, Any] = {}
+        if self.creds_path.is_file():
+            try:
+                saved = json.loads(self.creds_path.read_text(encoding="utf-8"))
+            except Exception:
+                saved = {}
+        if not self.node_secret and saved:
             self.node_secret = saved.get("node_secret", "")
             self.node_id = saved.get("node_id", "")
+
+        saved_name = str(saved.get("node_name") or "").strip()
+        saved_configured = str(saved.get("configured_node_name") or "").strip()
+        configured = str(node_name or "").strip()
+        self.configured_node_name = configured or saved_configured
+        if configured and (explicit_node_name or configured != saved_configured):
+            self.node_name = configured
+            self._pending_name_sync = True
+        else:
+            self.node_name = saved_name or configured
+            self._pending_name_sync = False
+
+    def _save_credentials(self) -> None:
+        if not self.node_id and not self.node_secret:
+            return
+        self.creds_path.write_text(
+            json.dumps(
+                {
+                    "node_id": self.node_id,
+                    "node_secret": self.node_secret,
+                    "node_name": self.node_name,
+                    "configured_node_name": self.configured_node_name,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(self.creds_path, 0o600)
 
     def _srv_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.node_secret}"}
@@ -193,8 +228,10 @@ class VcatAgentRunner:
         data = resp.json()
         self.node_id = data["node_id"]
         self.node_secret = data["node_secret"]
-        self.creds_path.write_text(json.dumps({"node_id": self.node_id, "node_secret": self.node_secret}), encoding="utf-8")
-        os.chmod(self.creds_path, 0o600)
+        self.node_name = str(data.get("node_name") or node_name).strip()
+        self.configured_node_name = str(node_name or self.node_name).strip()
+        self._pending_name_sync = False
+        self._save_credentials()
         return data
 
     def _mcp_post(self, payload: dict[str, Any], notification: bool = False, timeout: float = 30.0) -> dict[str, Any]:
@@ -253,16 +290,27 @@ class VcatAgentRunner:
             "pid": os.getpid(),
             "agent_home": str(Path(__file__).resolve().parent),
         }
-        resp = self._post_server(
-            "/internal/agents/heartbeat",
-            {
-                "mcp_ready": ready,
-                "vcat_version": caps.get("server_version", "3.1.0"),
-                "capabilities": caps,
-            },
-        )
+        payload: dict[str, Any] = {
+            "mcp_ready": ready,
+            "vcat_version": caps.get("server_version", "3.1.0"),
+            "capabilities": caps,
+        }
+        if self._pending_name_sync and self.node_name:
+            payload["node_name"] = self.node_name
+        resp = self._post_server("/internal/agents/heartbeat", payload)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        srv_name = str(data.get("node_name") or "").strip()
+        changed = False
+        if self._pending_name_sync:
+            self._pending_name_sync = False
+            changed = True
+        if srv_name and srv_name != self.node_name:
+            self.node_name = srv_name
+            changed = True
+        if changed and self.node_secret:
+            self._save_credentials()
+        return data
 
     def _load_receipts(self) -> dict[str, Any]:
         if not self.receipts_path.is_file():
@@ -382,8 +430,10 @@ def _start_local_health_server(runner: VcatAgentRunner, allowed_origin: str, por
                     "agent_online": True,
                     "mode": runner.mode,
                     "node_id": runner.node_id,
+                    "node_name": runner.node_name,
                     "mcp_ready": runner.last_mcp_ready,
-                }
+                },
+                ensure_ascii=False,
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -620,16 +670,19 @@ def main() -> int:
         print("请通过 --mcp-token 或环境变量 VCAT_MCP_TOKEN 提供本机小V猫 MCP 令牌", file=sys.stderr)
         return 2
 
+    cli_node_name_provided = any(arg == "--node-name" or arg.startswith("--node-name=") for arg in sys.argv[1:])
     runner = VcatAgentRunner(
         server_url=args.server,
         mcp_url=args.mcp_url,
         mcp_token=args.mcp_token,
         state_dir=state_dir,
         mode=args.mode,
+        node_name=(args.node_name or "").strip(),
+        explicit_node_name=cli_node_name_provided,
         poll_wait=args.poll_wait,
     )
     if args.pair_token:
-        runner.register(args.pair_token, args.node_name or f"{args.mode}-node")
+        runner.register(args.pair_token, (args.node_name or "").strip() or "niekun")
     if args.register_only:
         return 0
     if not runner.node_secret:
@@ -649,6 +702,13 @@ def main() -> int:
     parsed_srv = urlparse(args.server)
     allowed_origin = f"{parsed_srv.scheme}://{parsed_srv.netloc}" if parsed_srv.scheme and parsed_srv.netloc else ""
     health_srv = _start_local_health_server(runner, allowed_origin)
+    logger.info(
+        "vcat_agent 已启动 | node_name=%s | node_id=%s | mode=%s | server=%s",
+        runner.node_name or "未命名",
+        runner.node_id,
+        runner.mode,
+        runner.server_url,
+    )
     last_hb = 0.0
     last_cache_gc = time.monotonic()
     last_tick = [time.monotonic()]
